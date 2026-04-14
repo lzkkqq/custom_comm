@@ -1,20 +1,22 @@
-# FindCANN.cmake -- Locate CANN SDK for custom_comm
+# FindCANN.cmake -- locate CANN SDK headers and libraries for custom_comm.
 #
-# SDK path priority:
-#   1. CMake cache / -D flag
-#   2. $ASCEND_CANN_PACKAGE_PATH
-#   3. $ASCEND_HOME_PATH
+# Supports two SDK layouts:
+#   A. Installed toolkit (Docker / bare-metal):
+#        ${SDK}/include/hccl/hccl_types.h
+#        ${SDK}/pkg_inc/hccl/...
+#        ${SDK}/include/acl/acl.h
+#   B. Dev-tree (.sdk symlink, macOS syntax-check):
+#        ${SDK}/hcomm/hcomm/include/hccl/hccl_types.h
+#        ${SDK}/hcomm/hcomm/pkg_inc/...
+#        ${SDK}/npu-runtime/include/external/acl/...
+#
+# SDK root search order:
+#   1. -DASCEND_CANN_PACKAGE_PATH=...
+#   2. $ENV{ASCEND_CANN_PACKAGE_PATH}
+#   3. $ENV{ASCEND_HOME_PATH}
 #   4. /usr/local/Ascend/ascend-toolkit/latest
-#
-# Outputs:
-#   CANN_FOUND            - TRUE if SDK headers located
-#   CANN_INCLUDE_DIRS     - Public HCCL headers  (hccl_types.h, hccl_comm.h, ...)
-#   CANN_CCU_INCLUDE_DIRS - Internal CCU headers  (ccu_kernel.h, hccl_inner.h, ...)
-#   CANN_ACL_INCLUDE_DIRS - ACL runtime headers   (acl.h, acl_rt.h, ...)
-#   CANN_LIBRARY_DIRS     - Library search paths
-#   CANN_LIBRARIES        - Link targets (non-Apple only)
 
-# ---- SDK root discovery ----
+# ---- Resolve SDK root ----
 if(NOT ASCEND_CANN_PACKAGE_PATH)
     if(DEFINED ENV{ASCEND_CANN_PACKAGE_PATH})
         set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_CANN_PACKAGE_PATH}")
@@ -27,52 +29,50 @@ endif()
 set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_CANN_PACKAGE_PATH}" CACHE PATH "CANN SDK root")
 message(STATUS "CANN SDK root: ${ASCEND_CANN_PACKAGE_PATH}")
 
-# ---- hcomm subpackage (double-nested: hcomm/hcomm/) ----
-set(HCOMM_ROOT "${ASCEND_CANN_PACKAGE_PATH}/hcomm/hcomm")
+# ==== Detect SDK layout ====
+# Layout A: installed toolkit  (include/hccl/hccl_types.h directly under SDK root)
+# Layout B: dev-sdk tree       (hcomm/hcomm/include/hccl/hccl_types.h)
+set(_SDK "${ASCEND_CANN_PACKAGE_PATH}")
 
-set(CANN_INCLUDE_DIRS
-    "${HCOMM_ROOT}/include"       # hccl/hccl_types.h, hccl_comm.h, hccl_res.h
-    "${HCOMM_ROOT}/include/hccl"  # direct include without hccl/ prefix
-)
-set(CANN_CCU_INCLUDE_DIRS
-    "${HCOMM_ROOT}/pkg_inc"       # hcomm/ccu/ccu_kernel.h, hccl/hccl_inner.h, hccl/hcom.h
-)
-set(CANN_ACL_INCLUDE_DIRS
-    "${ASCEND_CANN_PACKAGE_PATH}/npu-runtime/runtime/include/external"  # acl/acl.h
-    "${ASCEND_CANN_PACKAGE_PATH}/npu-runtime/include"                   # securec.h
-)
-set(CANN_LIBRARY_DIRS
-    "${HCOMM_ROOT}/lib64"
-    "${ASCEND_CANN_PACKAGE_PATH}/lib64"
-)
-
-# ---- Validate header existence ----
-find_path(_HCCL_TYPES_H "hccl/hccl_types.h" PATHS ${CANN_INCLUDE_DIRS} NO_DEFAULT_PATH)
-if(_HCCL_TYPES_H)
-    set(CANN_FOUND TRUE)
-    message(STATUS "CANN headers found at: ${_HCCL_TYPES_H}")
+if(EXISTS "${_SDK}/include/hccl/hccl_types.h")
+    # Layout A: installed CANN toolkit
+    set(CANN_INCLUDE_DIRS "${_SDK}/include")
+    set(CANN_CCU_INCLUDE_DIRS "${_SDK}/pkg_inc")
+    set(CANN_ACL_INCLUDE_DIRS "${_SDK}/include")
+    set(CANN_LIBRARY_DIRS "${_SDK}/lib64")
+    set(_LAYOUT "installed")
+elseif(EXISTS "${_SDK}/hcomm/hcomm/include/hccl/hccl_types.h")
+    # Layout B: local dev-sdk (macOS syntax-check)
+    set(_HCOMM "${_SDK}/hcomm/hcomm")
+    set(CANN_INCLUDE_DIRS "${_HCOMM}/include" "${_HCOMM}/include/hccl")
+    set(CANN_CCU_INCLUDE_DIRS "${_HCOMM}/pkg_inc")
+    set(CANN_ACL_INCLUDE_DIRS "${_SDK}/npu-runtime/runtime/include/external")
+    set(CANN_LIBRARY_DIRS "${_SDK}/lib64")
+    set(_LAYOUT "dev-sdk")
 else()
     set(CANN_FOUND FALSE)
-    message(WARNING "CANN SDK headers not found. C++ syntax-check will fail. "
-                    "Set ASCEND_CANN_PACKAGE_PATH to SDK root.")
+    message(WARNING "CANN SDK headers not found under ${_SDK}. "
+                    "Set ASCEND_CANN_PACKAGE_PATH to the SDK root.")
+    return()
 endif()
 
-# ---- Libraries (skip on macOS -- syntax-check only) ----
-if(NOT APPLE AND CANN_FOUND)
-    find_library(HCOMM_LIB    hcomm    PATHS ${CANN_LIBRARY_DIRS} NO_DEFAULT_PATH)
-    find_library(ASCENDCL_LIB ascendcl PATHS ${CANN_LIBRARY_DIRS} NO_DEFAULT_PATH)
+set(CANN_FOUND TRUE)
+message(STATUS "CANN SDK layout: ${_LAYOUT} (${_SDK})")
+message(STATUS "  include:  ${CANN_INCLUDE_DIRS}")
+message(STATUS "  pkg_inc:  ${CANN_CCU_INCLUDE_DIRS}")
 
-    set(CANN_LIBRARIES "")
-    if(HCOMM_LIB)
-        list(APPEND CANN_LIBRARIES ${HCOMM_LIB})
-    endif()
-    if(ASCENDCL_LIB)
-        list(APPEND CANN_LIBRARIES ${ASCENDCL_LIB})
-    endif()
-    message(STATUS "CANN libraries: ${CANN_LIBRARIES}")
-else()
-    set(CANN_LIBRARIES "")
-    if(APPLE)
-        message(STATUS "macOS detected -- skipping CANN library linking (syntax-check mode)")
+# ---- Validate that hccl_types.h is reachable ----
+find_path(_HCCL_TYPES_DIR hccl/hccl_types.h PATHS ${CANN_INCLUDE_DIRS} NO_DEFAULT_PATH)
+if(NOT _HCCL_TYPES_DIR)
+    set(CANN_FOUND FALSE)
+    message(WARNING "hccl/hccl_types.h not found in ${CANN_INCLUDE_DIRS}")
+    return()
+endif()
+
+# ---- Libraries (non-Apple only) ----
+if(NOT APPLE)
+    find_library(CANN_HCCL_LIB hccl PATHS ${CANN_LIBRARY_DIRS} NO_DEFAULT_PATH)
+    if(CANN_HCCL_LIB)
+        set(CANN_LIBRARIES ${CANN_HCCL_LIB})
     endif()
 endif()
