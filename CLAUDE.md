@@ -1,83 +1,63 @@
 # CLAUDE.md
 
-This file provides guidance for Claude Code when working with this repository.
+This file provides guidance to Claude Code for working with this repository.
 
 ## Project Overview
 
-custom_comm is a custom communication operator library for Ascend NPU (CANN ecosystem).
-It delivers high-performance batched collective operations as PyTorch custom ops, with
-both eager-mode and graph-mode (torchair/aclgraph) support on Atlas 800T A2 (Ascend 910B).
+custom_comm is a library of high-performance custom communication operators for
+Ascend NPU (CANN ecosystem). It provides batched collective operations as PyTorch
+custom ops via torch_npu, with support for eager mode, graph mode (torchair), and
+heterogeneous-dtype tensors.
 
-The first operator is `allgather_batch` -- a fused, batched AllGather that gathers
-up to 8 heterogeneous tensors in a single collective call, avoiding per-tensor launch
-overhead.  Two execution paths exist:
-
-- Phase 1 (decomposed): packs tensors into a contiguous buffer, calls HcclAllGather once, unpacks.
-- Phase 2 (CCU): programs the CCU directly via HComm primitives for zero-copy RDMA gather.
-
-## Repository Layout
-
-    CMakeLists.txt              # C++ build (syntax-check on macOS, full build on NPU host)
-    cmake/FindCANN.cmake        # SDK discovery (hccl, acl, hcomm headers & libs)
-    setup.py                    # pip install -e . (calls torch.utils.cpp_extension)
-    ops/
-      allgather_batch/
-        inc/                    # C/C++ headers (.h)
-        src/                    # C/C++ sources (.cc)
-    python/
-      custom_comm/
-        __init__.py             # torch.ops.load_library + Python API
-        ops.py                  # torch.autograd.Function wrappers
-        converters/             # torchair GE graph-mode converters
-    tests/
-      test_allgather_batch.py   # unit tests (meta + NPU)
-      test_graph_mode.py        # torchair graph-mode tests
-    docs/
-      design/                   # Architecture diagrams (PlantUML, d2)
-      raw/                      # Design docs, analysis, reviews
-
-## Build & Install
-
-### Prerequisites
-
-- CANN 9.0.0 SDK (`ASCEND_CANN_PACKAGE_PATH` or default `/usr/local/Ascend/ascend-toolkit/latest`)
-- PyTorch 2.1+ with torch_npu
-- Python 3.8+
-
-### Source install (on NPU host)
-
-    pip install -e .
-
-### Syntax-check only (macOS, no CANN runtime)
-
-    cmake -B build && cmake --build build
-
-## Testing
-
-    # Meta-device tests (no NPU needed):
-    pytest tests/ -k "Meta"
-
-    # NPU functional tests (single node, N devices):
-    torchrun --nproc_per_node=N pytest tests/test_allgather_batch.py
+Target platform: Atlas A5 (Ascend 910_95), CANN 9.0+.
 
 ## Architecture
 
-Two execution phases, selected at runtime via `CUSTOM_COMM_USE_CCU` env var:
+The first operator is `allgather_batch` -- gather up to 8 heterogeneous-dtype
+tensors in a single collective call. Two execution paths:
 
-- Phase 1 (default): Decomposed strategy -- packs heterogeneous descriptors into a
-  contiguous buffer, calls `HcclAllGather` once, then unpacks.  Works on any CANN version.
-- Phase 2 (CCU):  Registers a CCU kernel via `HcclRegisterCustomKernel`, launches a
-  single CCU program that performs direct RDMA gather per descriptor.  Requires HComm
-  CCU API (CANN 9.0+).
+- Phase 1 (decomposed): packs tensors into a flat buffer, calls HcclAllGather once, unpacks.
+- Phase 2 (CCU): launches a single CCU kernel for zero-copy RDMA gather per descriptor.
 
-### Key interfaces
+Selected at runtime via `CUSTOM_COMM_USE_CCU=1`.
 
-- C API: `ops/allgather_batch/inc/hccl_custom_allgather_batch.h` -- `HcclAllGatherBatch()`
-- Python: `custom_comm.allgather_batch(inputs, hcom, world_size)` -- torch custom op
-- Graph mode: `python/custom_comm/converters/` -- torchair FX-to-GE converter
+## Repository Layout
 
-## Code Style
+    CMakeLists.txt              C++ build (standalone libcustom_comm_ops.so)
+    setup.py                    Python package (torch NpuExtension)
+    cmake/FindCANN.cmake        SDK detection (installed toolkit or dev-tree)
+    ops/allgather_batch/
+      inc/                      C/C++ headers (C API, common defs, CCU kernel)
+      src/                      Implementation (dispatch, decomposed, CCU, engine ctx)
+    torch_ext/csrc/             PyTorch C++ extension (op registration + NPU/Meta impl)
+    python/custom_comm/         Python package
+      ops.py                    torch.autograd wrapper
+      converters/               torchair GE graph-mode converter
+    tests/                      pytest (meta + NPU functional + benchmark)
+    docs/                       Design docs, architecture diagrams
 
-- C++17, formatted by `.clang-format` (4-space indent, ~100 col limit)
-- Python: standard PEP 8, no additional formatter enforced
-- License header: `Copyright (c) 2026 custom_comm Authors. SPDX-License-Identifier: Apache-2.0`
+## Build
+
+C++ only (syntax check):
+
+    cmake -B build && cmake --build build
+
+Python extension (requires CANN SDK + torch_npu):
+
+    source ~/Ascend/set_env.sh
+    export LD_LIBRARY_PATH=~/Ascend/cann-9.0.0/x86_64-linux/lib64:$LD_LIBRARY_PATH
+    pip install -e .
+
+## Testing
+
+    pytest tests/ -k "meta"           # Meta-device shape tests (no NPU needed)
+    pytest tests/ -v                   # All available tests
+    torchrun --nproc_per_node=N pytest tests/  # NPU functional (needs hardware)
+
+## Key Constraints
+
+- CANN 9.0 SDK required (headers in `include/hccl/`, `pkg_inc/`, runtime in `x86_64-linux/lib64/`)
+- torch_npu NpuExtension injects its own ACL headers; do NOT add `${SDK}/include` broadly to
+  setup.py include_dirs -- only `include/hccl/`, `include/hcomm/`, `pkg_inc/`
+- `hccl_custom_allgather_batch.h` uses forward-declared `aclrtStream` (not `#include <acl/acl_base_rt.h>`)
+  to avoid conflicts with torch_npu's bundled ACL headers

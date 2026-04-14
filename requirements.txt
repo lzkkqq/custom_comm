@@ -1,2 +1,4 @@
-torch>=2.1
-torch_npu
+torch>=2.6
+torch_npu>=2.6
+pyyaml
+numpy
