@@ -1,64 +1,133 @@
 # custom_comm
 
-面向昇腾 NPU 的高性能自定义通信算子库。在 HCCL/HComm 之上实现批量异构集合通信，
-通过 PyTorch custom op 接口集成，支持 eager mode 和 graph mode (torchair)。
+custom_comm is a library of high-performance custom communication operators for
+Ascend NPUs. It provides fused collective primitives on top of HCCL/HComm,
+registered as PyTorch custom ops via `torch_npu`, with support for eager mode,
+`torch.compile` (torchair GE graph mode), and aclGraph capture.
 
-## 前置依赖
+The first operator is `allgather_batch` -- a batched AllGather that gathers up
+to 8 heterogeneous-dtype tensors in a single collective call, eliminating
+per-tensor kernel launch overhead. The primary use case is MoE quantized
+inference, where INT8 activations, FP32 scales, and INT32 routing indices need
+to be gathered together.
 
-- CANN 9.0+ (Atlas A5 / Ascend 910_95)
+## Prerequisites
+
+custom_comm requires the following:
+
+- Ascend NPU with CANN 9.0+ toolkit (Atlas A5 / Ascend 950)
 - Python 3.10+
-- PyTorch 2.6+ / torch_npu 2.6+
+- PyTorch >= 2.6
+- torch_npu >= 2.6
 
-## 安装
+## Installation
 
-预编译 wheel（推荐）：
-
-```bash
-pip install custom_comm
-```
-
-从源码安装（需要 CANN toolkit）：
+### From source (recommended)
 
 ```bash
-source /path/to/Ascend/set_env.sh
+# Ensure CANN environment is set up
+source ~/Ascend/set_env.sh
+
+# Install in development mode
 pip install -e .
 ```
 
-## 快速开始
+### Build C++ library only
+
+For integration without Python bindings:
+
+```bash
+cmake -B build
+cmake --build build
+```
+
+## Quick Start
 
 ```python
-import torch, torch_npu, custom_comm
+import torch
+import torch_npu
+import custom_comm
 
 torch.distributed.init_process_group(backend="hccl")
 rank = torch.distributed.get_rank()
 world_size = torch.distributed.get_world_size()
 torch.npu.set_device(rank)
 
+# Obtain HCCL communicator handle
 pg = torch.distributed.group.WORLD
 hcom = pg._get_backend(torch.device(f"npu:{rank}")).get_hccl_comm_name(rank)
 
-# 三合一 AllGather: INT8 数据 + FP32 scale + INT32 topk_ids
-data = torch.randn(2048, 4096, dtype=torch.int8, device=f"npu:{rank}")
-scale = torch.randn(2048, dtype=torch.float32, device=f"npu:{rank}")
-ids = torch.randint(0, 8, (2048,), dtype=torch.int32, device=f"npu:{rank}")
+# Batched AllGather: INT8 data + FP32 scales + INT32 topk_ids in one call
+data = torch.randint(0, 127, (2048, 4096), dtype=torch.int8, device="npu")
+scales = torch.randn(2048, dtype=torch.float32, device="npu")
+ids = torch.randint(0, 8, (2048,), dtype=torch.int32, device="npu")
 
-gathered = custom_comm.allgather_batch([data, scale, ids], hcom, world_size)
+results = custom_comm.allgather_batch([data, scales, ids], hcom, world_size)
+# results[0]: (2048 * world_size, 4096) int8
+# results[1]: (2048 * world_size,)      float32
+# results[2]: (2048 * world_size,)      int32
 ```
 
-### Graph Mode
+### Running
+
+```bash
+torchrun --nproc_per_node=8 your_script.py
+```
+
+## Execution Modes
+
+custom_comm supports two runtime strategies for the batched AllGather operation,
+selected via the `CUSTOM_COMM_USE_CCU` environment variable:
+
+### Phase 1: Decomposed (default)
+
+Packs all input tensors into a single contiguous buffer (byte-level view), performs
+one `HcclAllGather` call, then unpacks the results. This path works on all CANN
+versions and does not require CCU hardware scheduling.
+
+### Phase 2: CCU Batched
+
+Registers a custom CCU kernel that performs zero-copy RDMA gathers directly between
+each descriptor's send/recv buffers. Eliminates pack/unpack overhead and reduces
+HBM traffic. Requires CANN 9.0+ with HComm CCU support.
+
+```bash
+# Enable CCU path
+CUSTOM_COMM_USE_CCU=1 torchrun --nproc_per_node=8 your_script.py
+```
+
+## Graph Mode
+
+### GE Graph (torchair)
+
+custom_comm registers a torchair GE converter that decomposes `allgather_batch`
+into multiple `HcomAllGather` GE nodes. This preserves graph-level optimizations
+while providing correct semantics:
 
 ```python
 @torch.compile(backend="npu")
-def fn(x, s, hcom, ws):
-    return custom_comm.allgather_batch([x, s], hcom, ws)
+def step(x, s, ids):
+    return custom_comm.allgather_batch([x, s, ids], hcom, world_size)
 ```
 
-## 测试
+### aclGraph Capture
+
+When the main stream is in aclGraph capture mode, `allgather_batch` automatically
+detects the capture state and registers the CCU slave stream into the graph model,
+so that Phase 2 CCU kernel operations are captured correctly.
+
+## Testing
 
 ```bash
-pytest tests/ -k "meta"                                  # shape 推导（无需 NPU）
-torchrun --nproc_per_node=8 -m pytest tests/             # NPU 功能测试
-torchrun --nproc_per_node=8 tests/bench_allgather_batch.py --ag09  # 性能基准
+# Shape inference tests (no NPU required)
+pytest tests/ -k "meta"
+
+# NPU functional tests
+torchrun --nproc_per_node=8 pytest tests/test_allgather_batch.py
+
+# Performance benchmarks
+torchrun --nproc_per_node=8 tests/bench_allgather_batch.py
+torchrun --nproc_per_node=8 tests/bench_allgather_batch.py --ag09
 ```
 
 ## License
