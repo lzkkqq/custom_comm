@@ -1,12 +1,11 @@
 # Copyright (c) 2026 custom_comm Authors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmarks for allgather_batch: homogeneous and OPT-AG-09 scenarios.
+"""Benchmark: allgather_batch vs N separate AllGather calls.
 
 Usage:
     torchrun --nproc_per_node=8 tests/bench_allgather_batch.py
     torchrun --nproc_per_node=8 tests/bench_allgather_batch.py --ag09
-    CUSTOM_COMM_USE_CCU=1 torchrun --nproc_per_node=8 tests/bench_allgather_batch.py
 """
 
 import os
@@ -14,6 +13,7 @@ import time
 import argparse
 
 import torch
+import torch.distributed as dist
 
 HAS_NPU = False
 try:
@@ -23,103 +23,110 @@ try:
 except ImportError:
     pass
 
-WARMUP = 10
-REPEAT = 100
+WARMUP = 50
+ITERS = 200
 
-# ---- Homogeneous benchmark (INT8, varying size and desc count) ----
 
-MSG_SIZES = [
-    ("4KB",   4 * 1024),
-    ("256KB", 256 * 1024),
-    ("2.5MB", 2_500_000),
-    ("10MB",  10 * 1024 * 1024),
-]
-DESC_COUNTS = [1, 2, 4, 8]
+def timed(fn):
+    for _ in range(WARMUP):
+        fn()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(ITERS):
+        fn()
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / ITERS * 1e6
+
+
+def bench_ag09(hcom, world_size, device):
+    """OPT-AG-09: INT8(N,H) + FP32(N) + INT32(N,K), 3 AG -> 1."""
+    N, H, K = 32, 7168, 8
+
+    x = torch.randint(0, 127, (N, H), dtype=torch.int8, device=device)
+    s = torch.randn(N, dtype=torch.float32, device=device)
+    ids = torch.randint(0, 100, (N, K), dtype=torch.int32, device=device)
+
+    # Pre-allocate outputs for baseline
+    ox = torch.empty(N * 8, H, dtype=torch.int8, device=device)
+    os_ = torch.empty(N * 8, dtype=torch.float32, device=device)
+    ok = torch.empty(N * 8, K, dtype=torch.int32, device=device)
+
+    def baseline():
+        dist.all_gather_into_tensor(ox, x)
+        dist.all_gather_into_tensor(os_, s)
+        dist.all_gather_into_tensor(ok, ids)
+
+    xf = x.contiguous().view(-1)
+    sf = s.contiguous().view(-1)
+    kf = ids.contiguous().view(-1)
+
+    def batched():
+        torch.ops.custom_comm.allgather_batch([xf, sf, kf], hcom, world_size)
+
+    world_size = dist.get_world_size()
+    t_base = timed(baseline)
+    t_batch = timed(batched)
+    return t_base, t_batch
 
 
 def bench_homogeneous(hcom, world_size, device):
+    """Homogeneous benchmark: varying desc count and size."""
     results = []
-    for desc_count in DESC_COUNTS:
-        for label, msg_bytes in MSG_SIZES:
-            inputs = [
-                torch.zeros(msg_bytes, dtype=torch.int8, device=device)
-                for _ in range(desc_count)
-            ]
-            for _ in range(WARMUP):
-                torch.ops.custom_comm.allgather_batch(inputs, hcom, world_size)
-            torch.npu.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(100):
-                torch.ops.custom_comm.allgather_batch(inputs, hcom, world_size)
-            torch.npu.synchronize()
-            us = (time.perf_counter() - t0) / 100 * 1e6
+    for desc_count in [1, 2, 4, 8]:
+        for label, nbytes in [("4KB", 4096), ("256KB", 256*1024), ("2.5MB", 2560000)]:
+            inputs = [torch.zeros(nbytes, dtype=torch.int8, device=device)
+                      for _ in range(desc_count)]
+            us = timed(lambda: torch.ops.custom_comm.allgather_batch(
+                inputs, hcom, world_size))
             results.append((desc_count, label, us))
-    return results
-
-
-# ---- OPT-AG-09: INT8 + FP32 scale + INT32 topk_ids ----
-
-def bench_ag09(hcom, world_size, device):
-    """Three-tensor batched AllGather mimicking quantized MoE AGRS."""
-    configs = [
-        ("2.5MB+scale+ids", 2560000, 56, 8),  # ~2.5MB int8, 56 fp32, 8 int32
-        ("256KB+scale+ids",  262144, 56, 8),
-        ("64KB+scale+ids",    65536, 56, 8),
-    ]
-    results = []
-    for label, n_int8, n_fp32, n_int32 in configs:
-        x = torch.zeros(n_int8, dtype=torch.int8, device=device)
-        s = torch.zeros(n_fp32, dtype=torch.float32, device=device)
-        ids = torch.zeros(n_int32, dtype=torch.int32, device=device)
-        for _ in range(WARMUP):
-            torch.ops.custom_comm.allgather_batch([x, s, ids], hcom, world_size)
-        torch.npu.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(100):
-            torch.ops.custom_comm.allgather_batch([x, s, ids], hcom, world_size)
-        torch.npu.synchronize()
-        us = (time.perf_counter() - t0) / 100 * 1e6
-        results.append((label, us))
     return results
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ag09", action="store_true")
     parser.add_argument("--local_rank", type=int, default=0)
-    parser.add_argument("--ag09", action="store_true", help="Run OPT-AG-09 scenario")
     args, _ = parser.parse_known_args()
 
     if not HAS_NPU:
-        print("NPU not available, skipping benchmark")
+        print("NPU not available")
         return
 
-    torch.distributed.init_process_group(backend="hccl")
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+    dist.init_process_group(backend="hccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     device = torch.device(f"npu:{rank}")
     torch.npu.set_device(device)
 
-    pg = torch.distributed.group.WORLD
+    pg = dist.group.WORLD
     hcom = pg._get_backend(device).get_hccl_comm_name(rank)
     phase = "CCU" if os.environ.get("CUSTOM_COMM_USE_CCU") == "1" else "Decomposed"
 
     if args.ag09:
-        results = bench_ag09(hcom, world_size, device)
+        t_base, t_batch = bench_ag09(hcom, world_size, device)
         if rank == 0:
+            speedup = t_base / t_batch if t_batch > 0 else 0
             print(f"\nOPT-AG-09 Benchmark (Phase: {phase}, W={world_size})")
-            print(f"  {'config':<30s}  {'us':>10s}")
-            print(f"  {'-'*30}  {'-'*10}")
-            for label, us in results:
-                print(f"  {label:<30s}  {us:>10.1f}")
+            print(f"  3x separate AG : {t_base:10.1f} us")
+            print(f"  1x allgather_batch : {t_batch:10.1f} us")
+            print(f"  Speedup        : {speedup:10.2f}x")
+            print(f"  Saved          : {t_base - t_batch:10.1f} us ({(1 - t_batch/t_base)*100:.1f}%)")
     else:
-        results = bench_homogeneous(hcom, world_size, device)
+        results = []
+        for n_desc in [1, 2, 4, 8]:
+            for label, size in [("4KB", 4096), ("256KB", 262144), ("2.5MB", 2500000)]:
+                inputs = [torch.zeros(size, dtype=torch.int8, device=device)
+                          for _ in range(n_desc)]
+                us = timed(lambda: torch.ops.custom_comm.allgather_batch(
+                    inputs, hcom, world_size))
+                results.append((n_desc, label, us))
         if rank == 0:
-            print(f"\nAllGatherBatch Benchmark (Phase: {phase}, W={world_size})")
+            print(f"\nAllGather Batch Benchmark (W={world_size})")
             print(f"  {'descs':>5} {'size':>10} {'us':>10}")
-            for dc, label, us in results:
-                print(f"  {dc:>5} {label:>10} {us:>10.1f}")
+            for dc, lb, us in results:
+                print(f"  {dc:>5} {lb:>10} {us:>10.1f}")
 
-    torch.distributed.destroy_process_group()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
