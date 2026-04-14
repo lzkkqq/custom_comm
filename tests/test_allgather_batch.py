@@ -156,11 +156,12 @@ class TestNpuFunctional:
     @pytest.mark.parametrize("dtype", [torch.int8, torch.float16, torch.float32, torch.bfloat16])
     def test_single_desc(self, dtype):
         n = 128
-        inp = (torch.arange(n, device=self.device) + self.rank * n).to(dtype)
+        # Build on CPU then transfer to avoid NPU arange dtype limitations.
+        inp = (torch.arange(n) + self.rank * n).to(dtype).to(self.device).contiguous()
         outs = torch.ops.custom_comm.allgather_batch([inp], self.hcom, self.world_size)
         assert outs[0].shape == (n * self.world_size,)
         for r in range(self.world_size):
-            expected = (torch.arange(n, device=self.device) + r * n).to(dtype)
+            expected = (torch.arange(n) + r * n).to(dtype).to(self.device).contiguous()
             assert torch.equal(outs[0][r * n:(r + 1) * n], expected)
 
     def test_heterogeneous_int8_fp32(self):
@@ -213,7 +214,7 @@ class TestCcuPath:
     def test_ccu_matches_decomposed(self):
         """CCU output must match decomposed output bit-exactly."""
         import os
-        data = (torch.arange(256, device=self.device) + self.rank).to(torch.int8)
+        data = (torch.arange(256) + self.rank).to(torch.int8).to(self.device)
         scale = torch.randn(4, device=self.device, dtype=torch.float32)
 
         # Phase 1

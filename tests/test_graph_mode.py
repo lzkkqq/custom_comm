@@ -164,7 +164,7 @@ class TestGraphModeE2E:
         """GE graph output should match eager output."""
         import custom_comm
 
-        x = (torch.arange(32, device=self.device) + self.rank).to(torch.int8)
+        x = (torch.arange(32) + self.rank).to(torch.int8).to(self.device)
         s = torch.full((4,), float(self.rank), dtype=torch.float32, device=self.device)
 
         eager_out = custom_comm.allgather_batch([x, s], self.hcom, self.world_size)
@@ -225,7 +225,7 @@ class TestAclGraphCapture:
         """Multiple replays should give consistent results."""
         import custom_comm
 
-        data = torch.arange(32, device=self.device).to(torch.int8)
+        data = torch.arange(32).to(torch.int8).to(self.device)
         _ = custom_comm.allgather_batch([data], self.hcom, self.world_size)
         torch.npu.synchronize()
 
