@@ -8,7 +8,10 @@
 
 #include <cstdint>
 #include <hccl/hccl_types.h>
-#include <acl/acl_base_rt.h>
+
+// Forward-declare aclrtStream to avoid pulling in the full ACL runtime header.
+// This prevents redefinition conflicts when torch_npu bundles its own ACL headers.
+typedef void *aclrtStream;
 
 #ifdef __cplusplus
 extern "C" {

@@ -18,11 +18,13 @@ SDK = os.environ.get(
 #   B) Dev-SDK tree:      ${SDK}/hcomm/hcomm/include/hccl/hccl_types.h
 _hcomm = os.path.join(SDK, "hcomm", "hcomm")
 if os.path.isfile(os.path.join(SDK, "include", "hccl", "hccl_types.h")):
-    # NpuExtension auto-adds torch_npu/include/third_party/acl/inc (ACL headers).
-    # Only add HCCL and pkg_inc here; avoid SDK/include/ to prevent ACL redefinition.
+    # SDK/include is needed for hccl/hccl_comm.h (not bundled in torch_npu).
+    # NpuExtension also injects torch_npu's own ACL/HCCL headers, but ours
+    # come first in the search order.  Our header (hccl_custom_allgather_batch.h)
+    # forward-declares aclrtStream to avoid pulling in acl_base_rt.h.
     _inc = [
+        os.path.join(SDK, "include"),
         os.path.join(SDK, "include", "hccl"),
-        os.path.join(SDK, "include", "hcomm"),
         os.path.join(SDK, "pkg_inc"),
     ]
     _lib = [

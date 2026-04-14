@@ -70,8 +70,30 @@ Docker 中运行 `cmake --build` 或 `pip install` 后，`build/` 和 `*.egg-inf
     export http_proxy=http://127.0.0.1:10077
     export https_proxy=http://127.0.0.1:10077
 
-## 8. FindCANN.cmake 安装版需要额外 include 路径
+## 8. FindCANN.cmake 双布局支持
 
-CANN SDK 的 `pkg_inc/hcomm/ccu/` 内部头文件使用裸 `#include "hcomm_primitives.h"`，
-该文件实际位于 `include/hccl/`。CMake 的 include 路径需要同时包含
-`${SDK}/include` 和 `${SDK}/include/hccl`，否则编译失败。
+CANN SDK 有两种路径布局：
+
+- 安装版（inspkg/Docker）：`${SDK}/include/hccl/hccl_types.h`
+- 开发版（macOS .sdk）：`${SDK}/hcomm/hcomm/include/hccl/hccl_types.h`
+
+CMake 自动检测。如果都找不到，设置 `-DASCEND_CANN_PACKAGE_PATH=` 指向 SDK 根目录。
+
+## 9. setup.py 与 NpuExtension 的 ACL header 冲突
+
+NpuExtension 自动注入 `torch_npu/include/third_party/acl/inc/`。
+如果 setup.py 同时添加 `${SDK}/include/`，两套 `acl_base.h` 会导致
+符号重定义。解法：只添加 `${SDK}/include/hccl/`、`${SDK}/include/hcomm/`
+和 `${SDK}/pkg_inc/`，避免引入 SDK 的 acl 目录。
+
+项目头文件中的 `#include <acl/acl_base_rt.h>` 改为 forward-declare
+`typedef void *aclrtStream;`。
+
+## 10. torchair converter 注册 API 变更（torch_npu >= 2.9）
+
+`@register_fx_node_ge_converter` 行为变化：
+- 装饰后返回 `Converter` 对象而非原始函数
+- converter 挂在 `op._ge_converter` 属性上
+- 不再使用全局 `_CONVERTERS` dict
+
+测试应检查 `hasattr(op, "_ge_converter")` 而非查 dict。
