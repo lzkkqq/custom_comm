@@ -1,119 +1,146 @@
 # custom_comm
 
-High-performance custom communication operators for Ascend NPUs, built on top of
-HCCL and the CANN software stack.
+High-performance custom collective communication operators for Ascend NPUs.
 
-custom_comm provides fused, batched collective operations that are not available
-in the standard HCCL library. It integrates with PyTorch via `torch_npu` custom
-ops, supports both eager-mode and graph-mode (via torchair/aclgraph), and
-exposes a C API for direct integration with HCCL-based applications.
+custom_comm extends HCCL with fused communication primitives that are not
+available in the standard library. It exposes both a C API (for integration
+into runtimes) and a PyTorch custom-op interface (for direct use in Python
+training/inference scripts), with support for eager mode, `torch.compile`,
+and graph mode via torchair.
 
 ## Operators
 
 | Operator | Description |
-|:---|:---|
-| `allgather_batch` | Batched AllGather that gathers up to 8 heterogeneous-dtype tensors in a single call, avoiding per-tensor launch overhead |
+|---|---|
+| `allgather_batch` | Gather up to 8 heterogeneous-dtype tensors in a single operation, avoiding per-tensor launch overhead |
 
 ## Prerequisites
 
+- CANN 9.0.0 SDK (Atlas 800I A2 / Ascend 910B)
 - Python 3.8+
-- CANN 9.0.0 SDK
 - PyTorch 2.1+ with torch_npu
-- Ascend NPU (Atlas 800T A2 or equivalent)
-- CMake 3.14+
 
 ## Installation
 
-### From source (on Ascend host)
-
 ```bash
 # Ensure CANN environment is sourced
-source /usr/local/Ascend/ascendc-toolkit/latest/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
+# Install from source
 pip install -e .
 ```
 
-### Build C++ library only (for integration without Python)
+For C++ library only (no Python bindings):
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-## Quick start
+## Quick Start
 
 ```python
 import torch
 import torch_npu
 import custom_comm
 
-# Initialize distributed environment
+# Standard distributed setup
 torch.distributed.init_process_group(backend="hccl")
+rank = torch.distributed.get_rank()
+world_size = torch.distributed.get_world_size()
+torch.npu.set_device(rank)
 
-# Quantized activations (INT8) + scales (FP32) -- a common pattern in
-# quantized AllGather where data and metadata have different dtypes.
-activations = torch.randn(1024, 4096, dtype=torch.int8, device="npu")
-scales = torch.randn(1024, dtype=torch.float32, device="npu")
+# Obtain HCCL communicator name
+pg = torch.distributed.group.WORLD
+backend = pg._get_backend(torch.device(f"npu:{rank}"))
+hcom = backend.get_hccl_comm_name(rank)
 
-# Single batched AllGather -- one kernel launch for both tensors
-results = custom_comm.allgather_batch(
-    [activations, scales],
-    hcom=hcom_group_name,
-    world_size=world_size,
+# ---- Core use case: batched quantized AllGather ----
+# Gather INT8 activations and FP32 scales in a single operation,
+# instead of issuing two separate AllGather calls.
+activations = torch.randint(0, 127, (2048, 4096), dtype=torch.int8, device="npu")
+scales = torch.randn(2048, dtype=torch.float32, device="npu")
+
+gathered = custom_comm.allgather_batch(
+    [activations, scales], hcom, world_size
 )
-# results[0].shape == (1024 * world_size, 4096), dtype=int8
-# results[1].shape == (1024 * world_size,),      dtype=float32
+# gathered[0]: (2048 * world_size, 4096), int8
+# gathered[1]: (2048 * world_size,),       float32
 ```
 
-## Execution modes
+### Running
 
-| Mode | Env var | Description |
-|------|---------|-------------|
-| Phase 1 (default) | -- | Decomposed: packs tensors into a flat buffer, calls HcclAllGather once, unpacks |
-| Phase 2 (CCU) | `CUSTOM_COMM_USE_CCU=1` | Direct CCU kernel: zero-copy RDMA gather per descriptor, no pack/unpack |
+```bash
+torchrun --nproc_per_node=8 your_script.py
+```
 
-## Graph mode (torchair / aclgraph)
+## Execution Paths
 
-`custom_comm` registers a GE converter so the operator can run inside
-`torch.compile(backend="npu")` graphs.  The converter decomposes the batched
-call into N individual `HcomAllGather` nodes (GE has no native batched op).
+custom_comm supports two runtime strategies, selected via environment variable:
+
+| `CUSTOM_COMM_USE_CCU` | Strategy | Description |
+|:---:|---|---|
+| unset / `0` | Phase 1 (Decomposed) | Packs heterogeneous tensors into a flat byte buffer, calls `HcclAllGather` once, then unpacks. Works on all CANN versions. |
+| `1` | Phase 2 (CCU Kernel) | Registers a single CCU kernel that performs multi-descriptor RDMA gather directly. Zero-copy, lower latency. Requires CANN 9.0+ with HComm CCU support. |
+
+## Graph Mode (torchair)
+
+custom_comm registers a GE converter so `allgather_batch` works inside
+`torch.compile` / torchair traced graphs:
 
 ```python
 import torch
 import custom_comm
 
 @torch.compile(backend="npu")
-def my_fn(x, s):
-    return custom_comm.allgather_batch([x, s], "hcom_group", world_size=8)
+def step(x, s, hcom, world_size):
+    return custom_comm.allgather_batch([x, s], hcom, world_size)
+```
+
+The converter decomposes the batched op into N individual `HcomAllGather` GE
+nodes (GE does not yet have a native batched gather op). This preserves other
+graph-level optimizations while maintaining functional correctness.
+
+## Benchmarking
+
+```bash
+# Run on 8 NPUs, compare Phase 1 vs Phase 2
+torchrun --nproc_per_node=8 tests/bench_allgather_batch.py
+CUSTOM_COMM_USE_CCU=1 torchrun --nproc_per_node=8 tests/bench_allgather_batch.py
 ```
 
 ## Testing
 
 ```bash
-# Meta-dispatch tests (runs anywhere, no NPU required)
-pytest tests/ -k "not npu"
+# Shape-inference tests (no NPU needed, runs on macOS/Linux)
+pytest tests/ -k "meta"
 
-# Full NPU tests (requires Ascend device + HCCL init)
-pytest tests/
+# Full functional tests (requires NPU + HCCL)
+torchrun --nproc_per_node=2 -m pytest tests/test_allgather_batch.py -v
+
+# Graph-mode tests
+pytest tests/test_graph_mode.py -v
 ```
 
-## Project Structure
+## Project Layout
 
 ```
-custom_comm/
-  CMakeLists.txt                 # Build system
-  setup.py                       # pip install entry
-  cmake/FindCANN.cmake           # CANN SDK discovery
-  ops/
-    allgather_batch/
-      inc/                       # C headers (C API, engine, common defs)
-      src/                       # C++ implementation
-  python/custom_comm/            # Python package
-    __init__.py                  # torch custom op loading
-    converters/                  # GE graph-mode converters
-  tests/                         # pytest suite
-  docs/design/                   # Architecture diagrams (PlantUML, D2)
+CMakeLists.txt              CMake build (C++ library)
+setup.py                    Python package (torch extension)
+cmake/FindCANN.cmake        CANN SDK discovery
+ops/
+  allgather_batch/
+    inc/                    C/C++ headers (public C API + internals)
+    src/                    Implementation (dispatch, decomposed, CCU kernel)
+python/
+  custom_comm/
+    __init__.py             Package init, loads C extension
+    ops.py                  torch.ops wrapper
+    converters/             torchair GE graph-mode converters
+tests/                      Unit tests + benchmarks
+docs/
+  design/                   Architecture diagrams (PlantUML, d2)
+  raw/                      Design documents and analysis
 ```
 
 ## License
