@@ -176,3 +176,63 @@ class TestGraphModeE2E:
         graph_out = fn(x, s)
         assert torch.equal(eager_out[0], graph_out[0])
         assert torch.equal(eager_out[1], graph_out[1])
+
+
+# ============================================================
+# aclGraph capture tests (require NPU)
+# ============================================================
+
+@requires_npu
+@requires_ext
+class TestAclGraphCapture:
+    """Verify aclGraph capture works with allgather_batch."""
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        if not torch.distributed.is_initialized():
+            pytest.skip("requires distributed init")
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+        torch.npu.set_device(self.rank)
+        self.device = torch.device(f"npu:{self.rank}")
+        pg = torch.distributed.group.WORLD
+        self.hcom = pg._get_backend(self.device).get_hccl_comm_name(self.rank)
+
+    def test_aclgraph_capture_replay(self):
+        """aclGraph capture + replay should produce correct results."""
+        import custom_comm
+
+        data = torch.ones(64, dtype=torch.float16, device=self.device) * (self.rank + 1)
+        scale = torch.ones(4, dtype=torch.float32, device=self.device) * (self.rank + 1)
+
+        # Warmup (required before capture)
+        _ = custom_comm.allgather_batch([data, scale], self.hcom, self.world_size)
+        torch.npu.synchronize()
+
+        # Capture
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            out = custom_comm.allgather_batch([data, scale], self.hcom, self.world_size)
+
+        # Replay
+        graph.replay()
+        torch.npu.synchronize()
+
+        assert out[0].shape == (64 * self.world_size,)
+        assert out[1].shape == (4 * self.world_size,)
+
+    def test_aclgraph_repeated_replay(self):
+        """Multiple replays should give consistent results."""
+        import custom_comm
+
+        data = torch.arange(32, dtype=torch.int8, device=self.device)
+        _ = custom_comm.allgather_batch([data], self.hcom, self.world_size)
+        torch.npu.synchronize()
+
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            out = custom_comm.allgather_batch([data], self.hcom, self.world_size)
+
+        for _ in range(10):
+            graph.replay()
+        assert out[0].shape[0] == data.shape[0] * self.world_size
