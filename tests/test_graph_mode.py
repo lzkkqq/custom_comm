@@ -113,3 +113,66 @@ class TestConverterRegistration:
         assert has_attr or has_dict, (
             "converter not found via _ge_converter attr or _CONVERTERS dict"
         )
+
+
+# ============================================================
+# Graph mode end-to-end (require NPU + torchair)
+# ============================================================
+
+HAS_NPU = False
+try:
+    import torch_npu  # noqa: F401
+    HAS_NPU = torch.npu.is_available() if hasattr(torch, "npu") else False
+except ImportError:
+    pass
+
+requires_npu = pytest.mark.skipif(not HAS_NPU, reason="NPU not available")
+
+
+@requires_npu
+@requires_torchair
+@requires_ext
+class TestGraphModeE2E:
+    """End-to-end graph mode tests. Require NPU hardware."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        if not torch.distributed.is_initialized():
+            pytest.skip("dist not initialized")
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+        self.device = torch.device(f"npu:{self.rank}")
+        torch.npu.set_device(self.device)
+        pg = torch.distributed.group.WORLD
+        self.hcom = pg._get_backend(self.device).get_hccl_comm_name(self.rank)
+
+    def test_ge_graph_compile(self):
+        """Verify torch.compile(backend='torchair') can trace allgather_batch."""
+        import custom_comm
+
+        @torch.compile(backend="torchair")
+        def fn(x, s):
+            return custom_comm.allgather_batch([x, s], self.hcom, self.world_size)
+
+        x = torch.randn(64, dtype=torch.float16, device=self.device)
+        s = torch.randn(4, dtype=torch.float32, device=self.device)
+        out = fn(x, s)
+        assert out[0].shape == (64 * self.world_size,)
+        assert out[1].shape == (4 * self.world_size,)
+
+    def test_ge_graph_correctness(self):
+        """GE graph output should match eager output."""
+        import custom_comm
+
+        x = torch.arange(32, dtype=torch.int8, device=self.device) + self.rank
+        s = torch.full((4,), float(self.rank), dtype=torch.float32, device=self.device)
+
+        eager_out = custom_comm.allgather_batch([x, s], self.hcom, self.world_size)
+
+        @torch.compile(backend="torchair")
+        def fn(x, s):
+            return custom_comm.allgather_batch([x, s], self.hcom, self.world_size)
+
+        graph_out = fn(x, s)
+        assert torch.equal(eager_out[0], graph_out[0])
+        assert torch.equal(eager_out[1], graph_out[1])
