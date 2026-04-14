@@ -130,7 +130,35 @@ static HcclResult HcclAllGatherBatchImpl(
         }
 
         ProfMark("custom_comm::ccu_launch::begin", stream);
-        HcclResult result = custom_comm::LaunchCcuKernel(comm, &taskArg);
+
+        // Phase 2 CCU kernel launch with optional slave stream profiling
+        HcclResult result;
+#ifndef __APPLE__
+        // If slave stream available, record events for precise device timing
+        uint64_t threadHandle = 0;
+        aclrtStream slaveStream = nullptr;
+        if (custom_comm::GetCcuThreadHandle(comm, &threadHandle) == HCCL_SUCCESS
+            && threadHandle != 0) {
+            uint32_t infoLen = sizeof(aclrtStream);
+            HcclThreadResGetInfo(comm, threadHandle, THREAD_RES_TYPE_STREAM,
+                                 infoLen, reinterpret_cast<void **>(&slaveStream));
+        }
+        if (slaveStream != nullptr) {
+            aclrtEvent startEvt = nullptr, endEvt = nullptr;
+            aclrtCreateEvent(&startEvt);
+            aclrtCreateEvent(&endEvt);
+            aclrtRecordEvent(startEvt, slaveStream);
+            result = custom_comm::LaunchCcuKernel(comm, &taskArg);
+            aclrtRecordEvent(endEvt, slaveStream);
+            // Events can be queried later for elapsed time via aclrtEventElapsedTime
+            aclrtDestroyEvent(startEvt);
+            aclrtDestroyEvent(endEvt);
+        } else
+#endif
+        {
+            result = custom_comm::LaunchCcuKernel(comm, &taskArg);
+        }
+
         ProfMark("custom_comm::ccu_launch::end", stream);
         return result;
     }

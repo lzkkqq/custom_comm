@@ -342,4 +342,5 @@ HcclResult LaunchBatchedAGKernel(
     return HcclCcuKernelLaunch(comm, thread, kernel, &ccuArg);
 }
 
+
 }  // namespace custom_comm
