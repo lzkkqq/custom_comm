@@ -22,6 +22,9 @@ dist/
 # CANN SDK symlink (points into build/)
 .sdk
 
+# Claude Code
+.claude/
+
 # Tool-generated caches
 .cache/
 .pytest_cache/
