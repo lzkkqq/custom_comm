@@ -97,3 +97,35 @@ NpuExtension 自动注入 `torch_npu/include/third_party/acl/inc/`。
 - 不再使用全局 `_CONVERTERS` dict
 
 测试应检查 `hasattr(op, "_ge_converter")` 而非查 dict。
+
+## 11. CANN toolkit 4 月版本缺少 HcclThreadResGetInfo
+
+从 mirror 下载的 CANN 9.0 toolkit（含 4 月 8 日构建）不包含 `HcclThreadResGetInfo`
+API（头文件和 libhcomm.so 均无）。需要从 hcomm 源码仓库编译安装才能获得该符号。
+
+    cd hcomm && bash build.sh --full --pkg  # 在 Docker 容器中编译
+    bash build_out/cann-hcomm_*.run --full --install-path=$HOME/Ascend
+
+## 12. hcomm 源码编译需要 Docker 环境
+
+宿主机直接编译 hcomm 会遇到 `__sk__` 类型错误（SuperKernel 编译器问题）。
+需要在 `cann-build-9.0.0` Docker 容器中编译，容器内的 ccec 编译器版本与源码匹配。
+
+    docker exec cc-build bash -c 'source /usr/local/Ascend/set_env.sh && \
+        cd /workspace/hcomm && bash build.sh --full --pkg'
+
+## 13. hccl 源码编译依赖新版 hcomm
+
+hccl 编译必须在安装了最新 hcomm 之后进行（hccl 依赖 hcomm 的头文件和库）。
+安装顺序：hcomm -> hccl。
+
+## 14. rsync 同步代码比 git push/pull 更快
+
+通过 rsync 直接同步本地代码到蓝区，比 push 到 GitHub 再 pull 更快：
+
+    bash sync.sh    # 使用项目根目录的 sync.sh
+
+## 15. pip install 后 C 扩展丢失
+
+rsync 同步会覆盖 `*.egg-info`，导致 pip editable install 的符号链接失效。
+每次 rsync 后需要重新 `pip install -e .`。
