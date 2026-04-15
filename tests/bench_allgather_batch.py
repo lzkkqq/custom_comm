@@ -56,9 +56,6 @@ def main():
     tensors = [x, s, ids]
     bws = [t.nbytes // N for t in tensors]  # bytes per row
 
-    # Pre-compute uint8 views for C
-    u8_views = [t.reshape(N, -1).contiguous().view(torch.uint8) for t in tensors]
-
     # ── A) 3x dist.all_gather (list API) ────────────────────────
     def method_a():
         for t in tensors:
@@ -73,7 +70,8 @@ def main():
 
     # ── C) packed AG + unpack (Python reference) ────────────────
     def method_c():
-        packed = torch.cat(u8_views, dim=1)
+        u8 = [t.reshape(N, -1).contiguous().view(torch.uint8) for t in tensors]
+        packed = torch.cat(u8, dim=1)
         out = torch.empty(N * ws, packed.shape[1], dtype=torch.uint8, device=dev)
         dist.all_gather_into_tensor(out, packed)
         col = 0
