@@ -51,24 +51,39 @@ HcclResult HcomGetCommHandleByGroup(const char *group, HcclComm *commHandle);
 namespace {
 
 HcclComm GetCachedComm(c10::string_view group) {
+    // Fast path: thread-local single-entry cache, no lock.
+    // Covers the common case of repeated calls with the same group name.
+    thread_local std::string tl_key;
+    thread_local HcclComm    tl_comm = nullptr;
+    if (C10_LIKELY(tl_comm != nullptr &&
+                   group.size() == tl_key.size() &&
+                   std::memcmp(group.data(), tl_key.data(), tl_key.size()) == 0)) {
+        return tl_comm;
+    }
+
+    // Slow path: first call or group name changed.
     static std::mutex mu;
     static std::unordered_map<std::string, HcclComm> cache;
 
     std::string key(group.data(), group.size());
+    HcclComm comm = nullptr;
     {
         std::lock_guard<std::mutex> lk(mu);
         auto it = cache.find(key);
-        if (it != cache.end()) return it->second;
+        if (it != cache.end()) {
+            comm = it->second;
+        }
     }
-    HcclComm comm = nullptr;
-    HCCL_TORCH_CHECK(
-        HcomGetCommHandleByGroup(key.c_str(), &comm));
-    TORCH_CHECK(comm != nullptr,
-                "Failed to get HcclComm for group: ", key);
-    {
+    if (!comm) {
+        HCCL_TORCH_CHECK(HcomGetCommHandleByGroup(key.c_str(), &comm));
+        TORCH_CHECK(comm != nullptr,
+                    "Failed to get HcclComm for group: ", key);
         std::lock_guard<std::mutex> lk(mu);
         cache[key] = comm;
     }
+
+    tl_key = std::move(key);
+    tl_comm = comm;
     return comm;
 }
 
@@ -209,7 +224,48 @@ TORCH_LIBRARY_IMPL(custom_comm, Meta, m) {
 
 #include <torch/python.h>
 
+// In-place variant: outputs pre-allocated by caller, no return value overhead.
+static void allgather_batch_inplace(
+    const std::vector<at::Tensor> &inputs,
+    std::vector<at::Tensor> &outputs,
+    c10::string_view hcom,
+    int64_t world_size) {
+#ifndef CUSTOM_COMM_NO_NPU
+    TORCH_CHECK(!inputs.empty() && inputs.size() == outputs.size());
+    TORCH_CHECK(world_size > 0);
+    HcclComm comm = GetCachedComm(hcom);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
+
+    const int64_t N = inputs[0].size(0);
+    std::vector<at::Tensor> byte_views;
+    std::vector<int64_t> bws;
+    for (const auto &inp : inputs) {
+        int64_t bw = static_cast<int64_t>(inp.nbytes()) / N;
+        byte_views.push_back(
+            at::from_blob(inp.data_ptr(), {N, bw},
+                          inp.options().dtype(at::kByte)));
+        bws.push_back(bw);
+    }
+    auto packed = at::cat(byte_views, 1);
+    auto gathered = at::empty({N * world_size, packed.size(1)},
+                              packed.options());
+    HCCL_TORCH_CHECK(HcclAllGather(
+        packed.data_ptr(), gathered.data_ptr(),
+        static_cast<uint64_t>(packed.numel()),
+        HCCL_DATA_TYPE_UINT8, comm, stream));
+
+    int64_t col = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        auto src = gathered.narrow(1, col, bws[i]);
+        at::from_blob(outputs[i].data_ptr(), {N * world_size, bws[i]},
+                      gathered.options())
+            .copy_(src);
+        col += bws[i];
+    }
+#endif
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("allgather_batch_eager", &allgather_batch_npu,
-          "allgather_batch via direct pybind11 call (no Dispatcher)");
+    m.def("allgather_batch_eager", &allgather_batch_npu);
+    m.def("allgather_batch_inplace", &allgather_batch_inplace);
 }
