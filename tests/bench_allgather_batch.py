@@ -99,7 +99,8 @@ def main():
             bar = "\u2588" * int(us / mx * 30)
             print(f"  {label:<{W}} {us:8.1f} us  {bar}")
         print()
-        print(f"  F vs B:  {tb/tf:.2f}x  (saved {tb - tf:.0f} us)")
+        print(f"  me vs ds:  {ta/tf:.2f}x  (saved {ta - tf:.0f} us)")
+        print(f"  me vs pg:  {tb/tf:.2f}x  (saved {tb - tf:.0f} us)")
         print(f"  Dispatcher:   {td - te:+.1f} us")
         print(f"  ReturnValue:  {te - tf:+.1f} us")
 
