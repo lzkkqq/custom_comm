@@ -112,7 +112,7 @@ def main():
         print(f"\nOPT-AG-04 Benchmark  W={ws}  N={N}")
         print("-" * 60)
         for label, us in results:
-            bar = "#" * int(us / mx * 25)
+            bar = "\u2588" * int(us / mx * 30)
             print(f"  {label:<{W}} {us:8.1f} us  {bar}")
         print()
         print(f"  C2 vs D:  {tc2/td:.2f}x  (delta {td - tc2:+.1f} us)")
