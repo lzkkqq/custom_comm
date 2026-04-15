@@ -86,12 +86,12 @@ def main():
 
     if rank == 0:
         W = 36
-        rows = [("A) 3x all_gather (list)",      ta),
-                ("B) 3x all_gather_into_tensor", tb),
-                ("C) packed AG + unpack",        tc),
-                ("D) torch.ops (Dispatcher)",    td),
-                ("E) pybind11 (eager)",          te),
-                ("F) pybind11 (in-place)",       tf)]
+        rows = [("A) 3 all_gather(list),ds3",       ta),
+                ("B) 3 all_gather_into_tensor,pg2",  tb),
+                ("C) 1 ag_packed,pure py",           tc),
+                ("D) 1 agb,torch.ops(Dispatcher)",   td),
+                ("E) 1 agb,pybind11(eager)",         te),
+                ("F) 1 agb,pybind11(in-place)",      tf)]
         mx = max(v for _, v in rows)
         print(f"\nOPT-AG-04 Benchmark  W={ws}  N={N}")
         print("-" * 60)
@@ -100,8 +100,8 @@ def main():
             print(f"  {label:<{W}} {us:8.1f} us  {bar}")
         print()
         print(f"  F vs B:  {tb/tf:.2f}x  (saved {tb - tf:.0f} us)")
-        print(f"  D vs E:  {td - te:+.1f} us  (Dispatcher)")
-        print(f"  E vs F:  {te - tf:+.1f} us  (return value)")
+        print(f"  Dispatcher:   {td - te:+.1f} us")
+        print(f"  ReturnValue:  {te - tf:+.1f} us")
 
     dist.destroy_process_group()
 
