@@ -29,7 +29,7 @@ HcclResult HcomGetCommHandleByGroup(const char *group, HcclComm *commHandle);
 
 #ifndef CUSTOM_COMM_NO_NPU
 #include "torch_npu/csrc/core/npu/NPUStream.h"
-#include <hccl/hccl.h>  // for HcclAllGather
+// hccl.h no longer needed -- we call HcclAllGatherBatch (from hccl_custom_allgather_batch.h)
 #endif
 
 // ============================================================
@@ -128,55 +128,30 @@ std::vector<at::Tensor> allgather_batch_npu(
 
     const uint32_t descCount = static_cast<uint32_t>(inputs.size());
 
-    // 1. Resolve hcom group name -> HcclComm handle (cached after first call)
+    // 1. Resolve comm handle and stream
     HcclComm comm = GetCachedComm(hcom);
-
-    // 2. Get current NPU stream
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
 
-    // 3. Pack tensors as uint8 rows, cat, single AllGather, split back.
-    //    Uses PyTorch caching allocator (no aclrtMalloc/Free per call).
-    //    Unpack: narrow(dim=1) is non-contiguous, so .contiguous() copies
-    //    each output tensor on device (not zero-copy).
-    const int64_t N = inputs[0].size(0);
-    std::vector<at::Tensor> byte_views;
-    std::vector<int64_t> byte_widths;
-    std::vector<std::vector<int64_t>> orig_shapes;
-
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        const auto &inp = inputs[i];
-        TORCH_CHECK(inp.dim() >= 1 && inp.is_contiguous());
-        TORCH_CHECK(inp.size(0) == N, "All inputs must have same dim-0");
-        int64_t bw = static_cast<int64_t>(inp.nbytes()) / N;
-        byte_views.push_back(
-            at::from_blob(inp.data_ptr(), {N, bw},
-                          inp.options().dtype(at::kByte)));
-        byte_widths.push_back(bw);
-        orig_shapes.push_back(inp.sizes().vec());
-    }
-
-    auto packed = at::cat(byte_views, /*dim=*/1);            // (N, sum_bw)
-    auto gathered = at::empty({N * world_size, packed.size(1)},
-                              packed.options());
-
-    // Single AllGather call (same as what torch.distributed uses)
-    HCCL_TORCH_CHECK(HcclAllGather(
-        packed.data_ptr(), gathered.data_ptr(),
-        static_cast<uint64_t>(packed.numel()),
-        HCCL_DATA_TYPE_UINT8, comm, stream));
-
-    // 4. Split gathered along columns and view back to original dtypes
+    // 2. Build descriptors, pre-allocate outputs
+    HcclAllGatherDesc descs[MAX_DESC_COUNT];
     std::vector<at::Tensor> outputs;
-    int64_t col = 0;
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        int64_t bw = byte_widths[i];
-        auto slice = gathered.narrow(/*dim=*/1, col, bw).contiguous();
-        col += bw;
-        auto out_shape = inputs[i].sizes().vec();
+    for (uint32_t i = 0; i < descCount; ++i) {
+        const auto &inp = inputs[i];
+        TORCH_CHECK(inp.is_contiguous());
+        auto out_shape = inp.sizes().vec();
         out_shape[0] *= world_size;
-        outputs.push_back(
-            slice.view(inputs[i].scalar_type()).reshape(out_shape));
+        auto out = at::empty(out_shape, inp.options());
+
+        descs[i].sendBuf   = inp.data_ptr();
+        descs[i].sendCount = static_cast<uint64_t>(inp.numel());
+        descs[i].dataType  = ScalarTypeToHcclDtype(inp.scalar_type());
+        descs[i].recvBuf   = out.data_ptr();
+        outputs.push_back(std::move(out));
     }
+
+    // 3. Single batched AllGather (Phase 1 decomposed or Phase 2 CCU)
+    HCCL_TORCH_CHECK(HcclAllGatherBatch(descs, descCount, comm, stream));
+
     return outputs;
 #endif
 }
@@ -224,7 +199,7 @@ TORCH_LIBRARY_IMPL(custom_comm, Meta, m) {
 
 #include <torch/python.h>
 
-// In-place variant: outputs pre-allocated by caller, no return value overhead.
+// In-place variant: caller provides pre-allocated output tensors.
 static void allgather_batch_inplace(
     const std::vector<at::Tensor> &inputs,
     std::vector<at::Tensor> &outputs,
@@ -233,35 +208,19 @@ static void allgather_batch_inplace(
 #ifndef CUSTOM_COMM_NO_NPU
     TORCH_CHECK(!inputs.empty() && inputs.size() == outputs.size());
     TORCH_CHECK(world_size > 0);
+    const uint32_t n = static_cast<uint32_t>(inputs.size());
     HcclComm comm = GetCachedComm(hcom);
+
+    HcclAllGatherDesc descs[MAX_DESC_COUNT];
+    for (uint32_t i = 0; i < n; ++i) {
+        descs[i].sendBuf   = inputs[i].data_ptr();
+        descs[i].sendCount = static_cast<uint64_t>(inputs[i].numel());
+        descs[i].recvBuf   = outputs[i].data_ptr();
+        descs[i].dataType  = ScalarTypeToHcclDtype(inputs[i].scalar_type());
+    }
+
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
-
-    const int64_t N = inputs[0].size(0);
-    std::vector<at::Tensor> byte_views;
-    std::vector<int64_t> bws;
-    for (const auto &inp : inputs) {
-        int64_t bw = static_cast<int64_t>(inp.nbytes()) / N;
-        byte_views.push_back(
-            at::from_blob(inp.data_ptr(), {N, bw},
-                          inp.options().dtype(at::kByte)));
-        bws.push_back(bw);
-    }
-    auto packed = at::cat(byte_views, 1);
-    auto gathered = at::empty({N * world_size, packed.size(1)},
-                              packed.options());
-    HCCL_TORCH_CHECK(HcclAllGather(
-        packed.data_ptr(), gathered.data_ptr(),
-        static_cast<uint64_t>(packed.numel()),
-        HCCL_DATA_TYPE_UINT8, comm, stream));
-
-    int64_t col = 0;
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        auto src = gathered.narrow(1, col, bws[i]);
-        at::from_blob(outputs[i].data_ptr(), {N * world_size, bws[i]},
-                      gathered.options())
-            .copy_(src);
-        col += bws[i];
-    }
+    HCCL_TORCH_CHECK(HcclAllGatherBatch(descs, n, comm, stream));
 #endif
 }
 
