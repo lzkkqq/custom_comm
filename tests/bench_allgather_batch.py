@@ -104,7 +104,7 @@ def main():
             bar = "\u2588" * int(us / mx * 30)
             print(f"  {label:<{W}} {us:8.1f} us  {bar}")
         print()
-        print(f"  C vs D:  {tc/td:.2f}x  (delta {td - tc:+.1f} us)")
+        print(f"  C vs B:  {tb/tc:.2f}x  (saved {tb - tc:.0f} us)")
         print(f"  D vs B:  {tb/td:.2f}x  (saved {tb - td:.0f} us)")
 
     dist.destroy_process_group()
