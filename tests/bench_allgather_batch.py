@@ -93,7 +93,9 @@ def main():
             bar = "█" * int(us / mx * 30) if mx > 0 else ""
             print(f"  {label:<34s} {us:8.1f} us  {bar}")
         print()
-        print(f"  D vs A: {ta/td:.2f}x   D vs B: {tb/td:.2f}x   D vs C: {tc/td:.2f}x")
+        print(f"  Baseline: B (3x all_gather_into_tensor)")
+        print(f"  C vs B: {tb/tc:.2f}x  (saved {tb-tc:.0f} us)")
+        print(f"  D vs B: {tb/td:.2f}x  (saved {tb-td:.0f} us)")
 
     dist.destroy_process_group()
 
