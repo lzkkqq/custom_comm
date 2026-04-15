@@ -72,9 +72,8 @@ def main():
         dist.all_gather_into_tensor(out, packed)
 
     # D) custom_comm C API
-    xf, sf, kf = x.reshape(-1), s.reshape(-1), ids.reshape(-1)
     def method_d():
-        torch.ops.custom_comm.allgather_batch([xf, sf, kf], hcom, ws)
+        torch.ops.custom_comm.allgather_batch([x, s, ids], hcom, ws)
 
     ta = timed(method_a)
     tb = timed(method_b)
