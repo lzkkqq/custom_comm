@@ -30,5 +30,8 @@ dist/
 .pytest_cache/
 .dage/
 
+# Raw session logs (may contain IPs, credentials)
+docs/raw/
+
 # OS
 .DS_Store
