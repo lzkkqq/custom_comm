@@ -57,15 +57,17 @@ try:
         "ops/allgather_batch/src/all_gather_batch.cc",
         "ops/allgather_batch/src/decomposed/decomposed_strategy.cc",
     ]
+    # CUSTOM_COMM_CCU: 0(default)=decomposed, 1=ccu, 2=ccu_v2
+    _ccu = os.environ.get("CUSTOM_COMM_CCU", "0")
     _extra_macros = []
-    if os.environ.get("CUSTOM_COMM_ENABLE_CCU", "0") == "1":
+    if _ccu == "1":
         _agb_sources += [
             "ops/allgather_batch/src/ccu/engine_ctx.cc",
             "ops/allgather_batch/src/ccu/ccu_kernel_ag_batch_mesh1d.cc",
         ]
         _extra_macros.append(("CUSTOM_COMM_ENABLE_CCU", "1"))
 
-    if os.environ.get("CUSTOM_COMM_ENABLE_CCU_V2", "") == "1":
+    elif _ccu == "2":
         _ccu_v2 = "ops/allgather_batch/src/ccu_v2"
         _agb_sources += [
             os.path.join(_ccu_v2, "op_host", "launch_kernel.cc"),
