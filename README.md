@@ -120,6 +120,9 @@ custom_comm provides profiling hooks at multiple levels:
 ## Testing
 
 ```bash
+# Smoke test: verify basic HCCL connectivity
+torchrun --nproc_per_node=8 tests/smoke_test.py
+
 # Meta-device shape inference (no NPU required)
 pytest tests/ -k "meta or Meta"
 
