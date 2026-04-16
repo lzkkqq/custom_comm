@@ -169,6 +169,17 @@ std::vector<at::Tensor> allgather_batch_npu(
 #else
     RECORD_FUNCTION("custom_comm::allgather_batch", {});
 
+    fprintf(stderr, "[custom_comm] allgather_batch  n=%zu  world_size=?  hcom=%.*s\n",
+            inputs.size(), (int)hcom.size(), hcom.data());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto &t = inputs[i];
+        fprintf(stderr, "  input[%zu]: dtype=%s  numel=%ld  shape=[",
+                i, c10::toString(t.scalar_type()), (long)t.numel());
+        for (int d = 0; d < t.dim(); ++d)
+            fprintf(stderr, "%s%ld", d ? "," : "", (long)t.size(d));
+        fprintf(stderr, "]\n");
+    }
+
     TORCH_CHECK(!inputs.empty(), "inputs must be non-empty");
     TORCH_CHECK(inputs.size() <= MAX_DESC_COUNT,
                 "inputs.size() (", inputs.size(), ") exceeds MAX_DESC_COUNT");
