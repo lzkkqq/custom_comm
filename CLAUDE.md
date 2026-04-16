@@ -50,9 +50,10 @@ Python extension (requires CANN SDK + torch_npu):
 
 ## Testing
 
-    pytest tests/ -k "meta"           # Meta-device shape tests (no NPU needed)
-    pytest tests/ -v                   # All available tests
-    torchrun --nproc_per_node=N pytest tests/  # NPU functional (needs hardware)
+    torchrun --nproc_per_node=2 tests/smoke_test.py  # Smoke: basic HCCL sanity
+    pytest tests/ -k "meta"                          # Meta-device shape tests (no NPU)
+    pytest tests/ -v                                  # All available tests
+    torchrun --nproc_per_node=N pytest tests/         # NPU functional (needs hardware)
 
 ## Blue Zone (Remote Build)
 
