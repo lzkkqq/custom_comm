@@ -11,6 +11,7 @@
 
 #include "engine_ctx.h"
 #include "common.h"
+#include "log_util.h"
 
 #include <hccl/hccl_comm.h>
 #include <hccl/hccl_res.h>
@@ -18,7 +19,6 @@
 #include <hcomm/ccu/hccl_ccu_res.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <vector>
 
 namespace custom_comm {
@@ -62,13 +62,18 @@ HcclResult InitCcuContext(HcclComm comm) {
     if (HcclEngineCtxGet(comm, CTX_TAG, COMM_ENGINE_CCU,
                          &ctx, &ctxSize) == HCCL_SUCCESS && ctx != nullptr) {
         auto *ccuCtx = static_cast<CcuContext *>(ctx);
-        if (ccuCtx->initialized) return HCCL_SUCCESS;
+        if (ccuCtx->initialized) {
+            CC_LOG_DEBUG("InitCcuContext: cached ctx hit");
+            return HCCL_SUCCESS;
+        }
         // Partial init from a prior failed attempt: SDK resource cleanup
         // semantics are opaque, so retrying is unsafe.  Surface the error.
+        CC_LOG_ERROR("InitCcuContext: partial context detected; refusing retry");
         return HCCL_E_INTERNAL;
     }
 
     // Slow path: first call -- allocate + register
+    CC_LOG_INFO("InitCcuContext: first-time registration");
 
     // 1. Create engine context slot
     HCCL_CHECK(HcclEngineCtxCreate(comm, CTX_TAG, COMM_ENGINE_CCU,
@@ -113,6 +118,8 @@ HcclResult InitCcuContext(HcclComm comm) {
     HCCL_CHECK(HcclCcuKernelRegisterFinish(comm));
 
     ccuCtx->initialized = true;
+    CC_LOG_INFO("InitCcuContext: ready (rank=%u/%u, peers=%u)",
+                rankId, rankSize, numPeers);
     return HCCL_SUCCESS;
 }
 
@@ -122,8 +129,10 @@ HcclResult InitCcuContext(HcclComm comm) {
 
 HcclResult LaunchCcuKernel(HcclComm comm, const void *taskArg) {
     auto *arg = static_cast<const AllGatherBatchTaskArg *>(taskArg);
-    fprintf(stderr, "[custom_comm][CCUv1] LaunchCcuKernel descCount=%u rank=%u/%u\n",
-            arg ? arg->descCount : 0, arg ? arg->rankId : 0, arg ? arg->rankSize : 0);
+    CC_LOG_INFO("LaunchCcuKernel: descCount=%u rank=%u/%u",
+                arg ? arg->descCount : 0U,
+                arg ? arg->rankId    : 0U,
+                arg ? arg->rankSize  : 0U);
     void *ctx = nullptr;
     uint64_t ctxSize = 0;
     HCCL_CHECK(HcclEngineCtxGet(comm, CTX_TAG, COMM_ENGINE_CCU,

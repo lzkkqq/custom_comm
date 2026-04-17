@@ -3,6 +3,7 @@
 
 #include "hccl_custom_allgather_batch.h"
 #include "common.h"
+#include "log_util.h"
 
 #include "ccu/engine_ctx.h"
 
@@ -178,9 +179,16 @@ HcclResult HcclAllGatherBatch(
     aclrtStream stream) {
 
     HCCL_CHECK(ValidateParams(descs, descCount));
+    CC_LOG_INFO("HcclAllGatherBatch: descCount=%u, useCcu=%d",
+                descCount, UseCcuPath() ? 1 : 0);
 
     ProfMark("custom_comm::allgather_batch::begin", stream);
     HcclResult result = HcclAllGatherBatchImpl(descs, descCount, comm, stream);
     ProfMark("custom_comm::allgather_batch::end", stream);
+
+    if (result != HCCL_SUCCESS) {
+        CC_LOG_ERROR("HcclAllGatherBatch failed with code=%d",
+                     static_cast<int>(result));
+    }
     return result;
 }

@@ -115,6 +115,12 @@ custom_comm provides profiling hooks at multiple levels:
 
 - `RECORD_FUNCTION`: `torch.profiler` timeline integration. The op appears as
   `custom_comm::allgather_batch` in PyTorch profiler traces and Chrome traces.
+- `plog`: runtime log stream via CANN's slog (`dlog_info`/`dlog_error` under the
+  hood). Both the decomposed path and the CCU v1 path emit tagged entries —
+  entry/exit, rank/size, and HCCL failure sites — routed through the HCCL
+  module id so they interleave with torch_npu / HCCL logs under
+  `~/ascend/log/debug/plog/plog-*_<pid>.log`. Raise verbosity via the standard
+  `ASCEND_GLOBAL_LOG_LEVEL=1` (INFO) knob; production defaults filter them out.
 - `aclprofMarkEx`: CANN profiler markers. Begin/end markers bracket the entire
   operation and the CCU kernel launch separately, visible in Ascend Insight.
 - **Slave stream events**: When using Phase 2 (CCU), `aclrtEvent` pairs are

@@ -13,6 +13,7 @@
 
 #include "hccl_custom_allgather_batch.h"
 #include "common.h"
+#include "log_util.h"
 
 #include <hccl/hccl_types.h>
 #include <acl/acl_rt.h>
@@ -71,12 +72,17 @@ HcclResult DecomposedAllGatherBatch(
     const HcclAllGatherDesc *descs, uint32_t descCount,
     HcclComm comm, aclrtStream stream) {
 
+    CC_LOG_DEBUG("DecomposedAllGatherBatch enter: descCount=%u", descCount);
+
     // 1. Compute byte sizes
     std::vector<uint64_t> perDescBytes;
     uint64_t totalBytes = 0;
     HCCL_CHECK(ComputeSendBytes(descs, descCount, perDescBytes, totalBytes));
 
-    if (totalBytes == 0) return HCCL_SUCCESS;
+    if (totalBytes == 0) {
+        CC_LOG_DEBUG("DecomposedAllGatherBatch: totalBytes=0, no-op");
+        return HCCL_SUCCESS;
+    }
 
     // 2. Get world size from communicator
     uint32_t worldSize = 0;
@@ -116,10 +122,15 @@ HcclResult DecomposedAllGatherBatch(
     }
 
     // 5. Single AllGather on packed uint8 buffer
+    CC_LOG_DEBUG("DecomposedAG: totalBytes=%llu worldSize=%u descCount=%u",
+                 static_cast<unsigned long long>(totalBytes), worldSize, descCount);
     result = HcclAllGatherInner(
         packedSend, packedRecv, totalBytes,
         HCCL_DATA_TYPE_UINT8, comm, stream);
-    if (result != HCCL_SUCCESS) goto cleanup;
+    if (result != HCCL_SUCCESS) {
+        CC_LOG_ERROR("HcclAllGatherInner failed: %d", static_cast<int>(result));
+        goto cleanup;
+    }
 
     // 6. Unpack: copy gathered data back to each desc's recvBuf
     //

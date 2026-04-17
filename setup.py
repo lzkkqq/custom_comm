@@ -80,7 +80,7 @@ try:
             os.path.join(os.path.dirname(__file__), "ops", "allgather_batch", "src", "ccu_v2", "inc"),
         ],
         library_dirs=_lib,
-        libraries=["hcomm", "ascendcl"] if _lib else [],
+        libraries=["hcomm", "ascendcl", "ascendalog"] if _lib else [],
         extra_compile_args=["-std=c++17"]
             + [f for d in _sdk_isystem for f in ("-isystem", d)],
         define_macros=[(k, v) for k, v in _extra_macros],
