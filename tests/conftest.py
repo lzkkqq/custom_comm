@@ -26,18 +26,24 @@ import pytest
 
 
 def _has(mod: str) -> bool:
+    # Use broad Exception (not just ImportError): some packages — notably
+    # torch_npu.dynamo.torchair — raise custom error types during import when
+    # their runtime deps are missing, and those don't subclass ImportError.
     try:
         importlib.import_module(mod)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
 def _npu_ready() -> bool:
     if not _has("torch_npu"):
         return False
-    import torch
-    return hasattr(torch, "npu") and bool(torch.npu.is_available())
+    try:
+        import torch
+        return hasattr(torch, "npu") and bool(torch.npu.is_available())
+    except Exception:
+        return False
 
 
 CAPS = SimpleNamespace(
