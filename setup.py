@@ -18,15 +18,14 @@ SDK = os.environ.get(
 #   B) Dev-SDK tree:      ${SDK}/hcomm/hcomm/include/hccl/hccl_types.h
 _hcomm = os.path.join(SDK, "hcomm", "hcomm")
 if os.path.isfile(os.path.join(SDK, "include", "hccl", "hccl_types.h")):
-    # NpuExtension injects torch_npu's bundled HCCL headers via -I.
-    # We must NOT add SDK/include as -I — it shadows torch_npu's hccl_types.h
-    # (different enum names across versions → build error).  Instead, add SDK
-    # headers as -isystem so they rank below torch_npu's -I paths.  This way
-    # hccl_comm.h / hccl_inner.h (not bundled in torch_npu) are still found.
-    _sdk_isystem = [
-        os.path.join(SDK, "include"),
-    ]
+    # Put CANN SDK headers FIRST on -I so they win over torch_npu's bundle.
+    # CANN 9.0's HcclCommConfig has fields (hcclAlgo, hcclBufferName,
+    # aclGraphZeroCopyMode, ...) that torch_npu 2.9's vendored hccl_types.h
+    # lacks; hccl_comm.h inline HcclCommConfigInit writes them, so the SDK
+    # header must be resolved first. ABI tracks libhccl.so we link against.
+    _sdk_isystem = []
     _inc = [
+        os.path.join(SDK, "include"),
         os.path.join(SDK, "pkg_inc"),
     ]
     _lib = [
@@ -69,6 +68,9 @@ try:
             "ops/allgather_batch/src/ccu/engine_ctx.cc",
             "ops/allgather_batch/src/ccu/ccu_kernel_ag_batch_mesh1d.cc",
         ]
+        for _sub in ["hcomm", "hcomm/ccu"]:
+            _inc.append(os.path.join(SDK, "pkg_inc", _sub))
+        _inc.append(os.path.join(SDK, "include", "hccl"))
         _extra_macros.append(("CUSTOM_COMM_ENABLE_CCU", "1"))
 
     elif _ccu == "2":
