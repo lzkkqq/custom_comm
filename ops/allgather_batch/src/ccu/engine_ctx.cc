@@ -91,24 +91,9 @@ HcclResult InitCcuContext(HcclComm comm) {
 
     const uint32_t numPeers = rankSize - 1;
 
-    // Allocate a small CCU scratch buffer and register it so the channels
-    // have a valid HcclMemHandle to reference. See CANN's
-    // examples/05_custom_ops_allgather for the expected pattern.
-    constexpr uint64_t kCcuScratchBytes = 4096;
-    void *ccuScratch = nullptr;
-    if (aclrtMalloc(&ccuScratch, kCcuScratchBytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
-        CC_LOG_ERROR("aclrtMalloc for CCU scratch failed: %llu bytes",
-                     (unsigned long long)kCcuScratchBytes);
-        return HCCL_E_INTERNAL;
-    }
-    (void)aclrtMemset(ccuScratch, kCcuScratchBytes, 0, kCcuScratchBytes);
-
-    CommMem commMem{COMM_MEM_TYPE_DEVICE, ccuScratch, kCcuScratchBytes};
-    HcclMemHandle memHandle{};
-    HCCL_CHECK(HcclCommMemReg(comm, CTX_TAG, &commMem, &memHandle));
-
-    // Build channelDesc for every link to every remote rank. Each peer may
-    // expose multiple physical links (netLayer=0 gives intra-NUMA links).
+    // Build channelDesc for every link to every remote rank. CCU requires
+    // memHandles=nullptr (no user buffer exchange — HCCL owns the ccl buf)
+    // and notifyNum=16 (hardcoded by ccu_urma_channel.cc).
     std::vector<HcclChannelDesc> channelDescs;
     for (uint32_t r = 0; r < rankSize; ++r) {
         if (r == rankId) continue;
@@ -119,9 +104,11 @@ HcclResult InitCcuContext(HcclComm comm) {
             HcclChannelDesc desc{};
             HcclChannelDescInit(&desc, 1);
             desc.remoteRank           = r;
-            desc.notifyNum            = NOTIFY_COUNT;
-            desc.memHandles           = &memHandle;
-            desc.memHandleNum         = 1;
+            // CCU engine requires notifyNum=16 exactly and rejects any
+            // user-supplied memHandles (it uses the HCCL shared buffer).
+            desc.notifyNum            = 16;
+            desc.memHandles           = nullptr;
+            desc.memHandleNum         = 0;
             desc.localEndpoint        = links[i].srcEndpointDesc;
             desc.remoteEndpoint       = links[i].dstEndpointDesc;
             desc.channelProtocol      = links[i].linkAttr.linkProtocol;
