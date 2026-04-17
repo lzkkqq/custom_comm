@@ -127,18 +127,17 @@ custom_comm provides profiling hooks at multiple levels:
 # Smoke test: verify basic HCCL connectivity
 torchrun --nproc_per_node=8 tests/smoke_test.py
 
-# Meta-device shape inference (no NPU required)
-pytest tests/ -k "meta or Meta"
+# Meta-only (no NPU, no torchrun): shape inference + converter registration
+pytest tests/ -m "not npu and not dist"
 
-# NPU functional tests (Phase 1 and Phase 2)
-torchrun --nproc_per_node=8 pytest tests/allgather_batch/test_eager.py
+# NPU eager tests: Phase 1 (decomposed) and Phase 2 (CCU)
+torchrun --nproc_per_node=8 -m pytest tests/allgather_batch/test_eager.py
 
-# Graph mode tests
-torchrun --nproc_per_node=8 pytest tests/allgather_batch/test_graph.py
+# Graph-mode tests: torchair converter + torch.compile + aclGraph capture
+torchrun --nproc_per_node=8 -m pytest tests/allgather_batch/test_graph.py
 
-# Performance benchmarks
+# OPT-AG-04 benchmark (Phase 1 vs Phase 2, switched at runtime)
 torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
-torchrun --nproc_per_node=8 tests/allgather_batch/bench.py --ag09
 CUSTOM_COMM_USE_CCU=1 torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
 ```
 
