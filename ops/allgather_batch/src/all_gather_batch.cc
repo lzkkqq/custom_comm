@@ -7,6 +7,7 @@
 
 #include "ccu/engine_ctx.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -67,8 +68,17 @@ static bool UseCcuPath() {
 
 #ifndef __APPLE__
 static inline void ProfMark(const char *msg, aclrtStream stream) {
-    // Best-effort: ignore errors (profiling is non-critical).
-    (void)aclprofMarkEx(msg, __builtin_strlen(msg), stream);
+    // Only emit the marker when a profiler is active; otherwise each call
+    // triggers a "MsprofTxManager is not inited yet" error log in CANN.
+    static std::atomic<bool> disabled{false};
+    if (disabled.load(std::memory_order_relaxed)) return;
+    aclError ret = aclprofMarkEx(msg, __builtin_strlen(msg), stream);
+    if (ret != ACL_SUCCESS) {
+        bool expected = false;
+        if (disabled.compare_exchange_strong(expected, true)) {
+            CC_LOG_INFO("ProfMark disabled: aclprofMarkEx=%d (profiler not active)", ret);
+        }
+    }
 }
 #else
 static inline void ProfMark(const char * /*msg*/, void * /*stream*/) {}
