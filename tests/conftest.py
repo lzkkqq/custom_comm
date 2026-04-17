@@ -93,7 +93,12 @@ def dist_ctx():
     device = torch.device(f"npu:{rank}")
     pg = dist.distributed_c10d._get_default_group()
     backend = pg._get_backend(device)
-    hcom = backend.get_hccl_comm_name(rank)
+    # Prefer the raw HcclComm handle (int64) exposed via get_hccl_comm() when
+    # available; fall back to the legacy name-based API otherwise.
+    if hasattr(backend, "get_hccl_comm"):
+        hcom = str(backend.get_hccl_comm(rank))
+    else:
+        hcom = backend.get_hccl_comm_name(rank)
 
     # Diagnostic: dump what torch_npu hands us so we can compare against
     # what HcomGetCommHandleByGroup expects.

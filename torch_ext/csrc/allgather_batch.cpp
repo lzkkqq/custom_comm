@@ -55,6 +55,23 @@ HcclResult HcomGetCommHandleByGroup(const char *group, HcclComm *commHandle);
 
 namespace {
 
+// If `group` is a decimal representation of an integer, treat it as the raw
+// HcclComm pointer value (i.e. what ProcessGroupHCCL::getHcclComm(rank)
+// returns stringified). This bypasses HcomGetCommHandleByGroup entirely,
+// which on some torch_npu versions can't resolve pg labels like "group_name_0".
+static HcclComm TryResolveCommFromInt(c10::string_view group) {
+    if (group.empty()) return nullptr;
+    for (char c : group) {
+        if (c < '0' || c > '9') return nullptr;
+    }
+    uint64_t value = 0;
+    for (char c : group) {
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (value == 0) return nullptr;
+    return reinterpret_cast<HcclComm>(static_cast<uintptr_t>(value));
+}
+
 HcclComm GetCachedComm(c10::string_view group) {
     thread_local std::string tl_key;
     thread_local HcclComm    tl_comm = nullptr;
@@ -75,8 +92,14 @@ HcclComm GetCachedComm(c10::string_view group) {
         }
     }
     if (!comm) {
-        HCCL_TORCH_CHECK(HcomGetCommHandleByGroup(key.c_str(), &comm));
-        TORCH_CHECK(comm != nullptr, "Failed to get HcclComm for group: ", key);
+        // Fast path: numeric group strings are raw HcclComm pointers
+        // (obtained via torch_npu ProcessGroupHCCL::get_hccl_comm(rank)).
+        // Fall back to HcomGetCommHandleByGroup for legacy name-based lookup.
+        comm = TryResolveCommFromInt(group);
+        if (!comm) {
+            HCCL_TORCH_CHECK(HcomGetCommHandleByGroup(key.c_str(), &comm));
+        }
+        TORCH_CHECK(comm != nullptr, "Failed to resolve HcclComm for: ", key);
         std::lock_guard<std::mutex> lk(mu);
         cache[key] = comm;
     }
