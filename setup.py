@@ -18,11 +18,10 @@ SDK = os.environ.get(
 #   B) Dev-SDK tree:      ${SDK}/hcomm/hcomm/include/hccl/hccl_types.h
 _hcomm = os.path.join(SDK, "hcomm", "hcomm")
 if os.path.isfile(os.path.join(SDK, "include", "hccl", "hccl_types.h")):
-    # Put CANN SDK headers FIRST on -I so they win over torch_npu's bundle.
-    # CANN 9.0's HcclCommConfig has fields (hcclAlgo, hcclBufferName,
-    # aclGraphZeroCopyMode, ...) that torch_npu 2.9's vendored hccl_types.h
-    # lacks; hccl_comm.h inline HcclCommConfigInit writes them, so the SDK
-    # header must be resolved first. ABI tracks libhccl.so we link against.
+    # Put CANN SDK headers FIRST on -I. The app links against CANN's
+    # libhccl.so so its struct layouts are authoritative; torch_npu 2.9
+    # bundles an older hccl_types.h (HcclCommConfig missing hcclAlgo,
+    # hcclBufferName, aclGraphZeroCopyMode, etc.) that must not shadow it.
     _sdk_isystem = []
     _inc = [
         os.path.join(SDK, "include"),
@@ -55,38 +54,19 @@ try:
     from torch_npu.utils.cpp_extension import NpuExtension
     from torch.utils.cpp_extension import BuildExtension
 
-    # Strategy sources: decomposed is always included; CCU is optional.
+    # decomposed + ccu (v1) are always compiled. Runtime dispatch uses
+    # CUSTOM_COMM_USE_CCU. CCU v2 is WIP; its sources live under
+    # ops/allgather_batch/src/ccu_v2/ but are not built by default.
     _agb_sources = [
         "ops/allgather_batch/src/all_gather_batch.cc",
         "ops/allgather_batch/src/decomposed/decomposed_strategy.cc",
+        "ops/allgather_batch/src/ccu/engine_ctx.cc",
+        "ops/allgather_batch/src/ccu/ccu_kernel_ag_batch_mesh1d.cc",
     ]
-    # CUSTOM_COMM_CCU: 0(default)=decomposed, 1=ccu, 2=ccu_v2
-    _ccu = os.environ.get("CUSTOM_COMM_CCU", "0")
-    _extra_macros = []
-    if _ccu == "1":
-        _agb_sources += [
-            "ops/allgather_batch/src/ccu/engine_ctx.cc",
-            "ops/allgather_batch/src/ccu/ccu_kernel_ag_batch_mesh1d.cc",
-        ]
-        for _sub in ["hcomm", "hcomm/ccu"]:
-            _inc.append(os.path.join(SDK, "pkg_inc", _sub))
-        _inc.append(os.path.join(SDK, "include", "hccl"))
-        _extra_macros.append(("CUSTOM_COMM_ENABLE_CCU", "1"))
-
-    elif _ccu == "2":
-        _ccu_v2 = "ops/allgather_batch/src/ccu_v2"
-        _agb_sources += [
-            os.path.join(_ccu_v2, "op_host", "launch_kernel.cc"),
-            os.path.join(_ccu_v2, "op_host", "host_utils.cc"),
-            os.path.join(_ccu_v2, "op_kernel", "ccu_kernel_all_gather_batch_mesh1d.cc"),
-        ]
-        # CCU v2 needs hcomm/ccu headers from SDK
-        # Scarlett's code uses bare includes like #include "ccu_kernel.h"
-        # which live under pkg_inc/hcomm/ccu/ in the SDK.
-        for _sub in ["hcomm", "hcomm/ccu"]:
-            _inc.append(os.path.join(SDK, "pkg_inc", _sub))
-            _inc.append(os.path.join(SDK, "x86_64-linux", "pkg_inc", _sub))
-        _extra_macros.append(("CUSTOM_COMM_ENABLE_CCU_V2", "1"))
+    for _sub in ("hcomm", "hcomm/ccu"):
+        _inc.append(os.path.join(SDK, "pkg_inc", _sub))
+    _inc.append(os.path.join(SDK, "include", "hccl"))
+    _extra_macros = [("CUSTOM_COMM_ENABLE_CCU", "1")]
 
     ext_modules = [NpuExtension(
         name="custom_comm._C",

@@ -58,7 +58,7 @@ static HcclResult ValidateParams(
 
 #ifdef CUSTOM_COMM_ENABLE_CCU
 static bool UseCcuPath() {
-    const char *val = std::getenv("CUSTOM_COMM_CCU");
+    const char *val = std::getenv("CUSTOM_COMM_USE_CCU");
     if (val == nullptr) return false;
     // Only "1" or "true" (case-sensitive) enables CCU path.
     // Avoids atoi to prevent undefined behavior on non-numeric strings.
