@@ -39,9 +39,14 @@ HcclResult HcomGetCommHandleByGroup(const char *group, HcclComm *commHandle);
 #define HCCL_TORCH_CHECK(call)                                      \
     do {                                                            \
         HcclResult _ret = (call);                                   \
+        if (_ret != HCCL_SUCCESS) {                                 \
+            CC_LOG_ERROR("HCCL_TORCH_CHECK failed: %s -> %d",       \
+                         #call, static_cast<int>(_ret));            \
+        }                                                           \
         TORCH_CHECK(_ret == HCCL_SUCCESS,                           \
             "HCCL error ", static_cast<int>(_ret),                  \
-            " at ", __FILE__, ":", __LINE__);                        \
+            " from ", #call,                                        \
+            " at ", __FILE__, ":", __LINE__);                       \
     } while (0)
 
 #define ACL_TORCH_CHECK(call)                                       \

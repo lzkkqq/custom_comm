@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <hccl/hccl_types.h>
 
+#include "log_util.h"
+
 // ============================================================
 // Constants
 // ============================================================
@@ -17,12 +19,15 @@ constexpr uint32_t MAX_DESC_COUNT = 8;
 // Error checking macros (CHK_RET style, ref-survey.md:68-79)
 // ============================================================
 
-#define HCCL_CHECK(call)                                              \
-    do {                                                              \
-        HcclResult _ret = (call);                                     \
-        if (_ret != HCCL_SUCCESS) {                                   \
-            return _ret;                                              \
-        }                                                             \
+#define HCCL_CHECK(call)                                                   \
+    do {                                                                   \
+        HcclResult _ret = (call);                                          \
+        if (_ret != HCCL_SUCCESS) {                                        \
+            CC_LOG_ERROR("HCCL_CHECK failed: %s -> %d at %s:%d",           \
+                         #call, static_cast<int>(_ret),                    \
+                         __FILE__, __LINE__);                              \
+            return _ret;                                                   \
+        }                                                                  \
     } while (0)
 
 // ============================================================
