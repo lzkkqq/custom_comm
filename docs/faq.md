@@ -132,7 +132,7 @@ rsync 同步会覆盖 `*.egg-info`，导致 pip editable install 的符号链接
 
 ## 16. CCU 路径编译报 HcclCommConfig 字段缺失
 
-现象：编译 CCU 代码路径时（默认行为，由 `CUSTOM_COMM_ENABLE_CCU` 宏开启），CANN 9.0 SDK 的 `hccl_comm.h`
+现象：编译 CCU 代码时（默认就会编译），CANN 9.0 SDK 的 `hccl_comm.h`
 内联初始化函数报一串 `'HcclCommConfig' has no member named 'hcclAlgo' /
 'hcclBufferName' / 'aclGraphZeroCopyEnable' / ...` 错误。
 

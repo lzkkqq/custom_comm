@@ -4,9 +4,7 @@
 #include "hccl_custom_allgather_batch.h"
 #include "common.h"
 
-#ifdef CUSTOM_COMM_ENABLE_CCU
 #include "ccu/engine_ctx.h"
-#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -14,10 +12,8 @@
 #ifndef __APPLE__
 #include <acl/acl_prof.h>
 #include <acl/acl_rt.h>
-#ifdef CUSTOM_COMM_ENABLE_CCU
 #include <hccl/hccl_comm.h>
 #include <hccl/hccl_res.h>
-#endif  // CUSTOM_COMM_ENABLE_CCU
 // RT internal: add slave stream to capture graph model
 extern "C" int rtStreamAddToModel(void *stream, void *model);
 #endif
@@ -56,7 +52,6 @@ static HcclResult ValidateParams(
 // Environment variable check for Phase 2 CCU path
 // ============================================================
 
-#ifdef CUSTOM_COMM_ENABLE_CCU
 static bool UseCcuPath() {
     const char *val = std::getenv("CUSTOM_COMM_USE_CCU");
     if (val == nullptr) return false;
@@ -64,7 +59,6 @@ static bool UseCcuPath() {
     // Avoids atoi to prevent undefined behavior on non-numeric strings.
     return (std::strcmp(val, "1") == 0 || std::strcmp(val, "true") == 0);
 }
-#endif  // CUSTOM_COMM_ENABLE_CCU
 
 // ============================================================
 // Profiling helpers
@@ -89,7 +83,6 @@ static HcclResult HcclAllGatherBatchImpl(
     HcclComm comm,
     aclrtStream stream) {
 
-#ifdef CUSTOM_COMM_ENABLE_CCU
     if (UseCcuPath()) {
         // Phase 2: CCU batched zero-copy AllGather
         uint32_t rankSize = 0;
@@ -170,7 +163,6 @@ static HcclResult HcclAllGatherBatchImpl(
         return result;
     }
 
-#endif  // CUSTOM_COMM_ENABLE_CCU
     // Phase 1: decomposed byte-packing strategy
     return custom_comm::DecomposedAllGatherBatch(descs, descCount, comm, stream);
 }
