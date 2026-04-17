@@ -13,6 +13,7 @@
 
 #include "hccl_custom_allgather_batch.h"
 #include "common.h"
+#include "log_util.h"
 
 // ============================================================
 // Forward declarations (symbols from libhcomm.so)
@@ -92,12 +93,18 @@ HcclComm GetCachedComm(c10::string_view group) {
         }
     }
     if (!comm) {
-        // Fast path: numeric group strings are raw HcclComm pointers
-        // (obtained via torch_npu ProcessGroupHCCL::get_hccl_comm(rank)).
-        // Fall back to HcomGetCommHandleByGroup for legacy name-based lookup.
+        // Fast path: parse numeric key as a raw HcclComm pointer value
+        // (conftest now passes str(backend.get_hccl_comm(rank)) — an int
+        // handle produced by ProcessGroupHCCL::getHCCLComm). Falls back to
+        // HcomGetCommHandleByGroup for legacy string-group usage.
         comm = TryResolveCommFromInt(group);
         if (!comm) {
             HCCL_TORCH_CHECK(HcomGetCommHandleByGroup(key.c_str(), &comm));
+            CC_LOG_INFO("GetCachedComm: resolved '%s' via HcomGetCommHandleByGroup -> %p",
+                        key.c_str(), comm);
+        } else {
+            CC_LOG_INFO("GetCachedComm: parsed '%s' as HcclComm handle -> %p",
+                        key.c_str(), comm);
         }
         TORCH_CHECK(comm != nullptr, "Failed to resolve HcclComm for: ", key);
         std::lock_guard<std::mutex> lk(mu);
