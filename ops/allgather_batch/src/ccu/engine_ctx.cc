@@ -14,9 +14,12 @@
 #include "log_util.h"
 
 #include <hccl/hccl_comm.h>
+#include <hccl/hccl_rank_graph.h>
 #include <hccl/hccl_res.h>
 #include <hcomm/ccu/ccu_kernel.h>
 #include <hcomm/ccu/hccl_ccu_res.h>
+
+#include <acl/acl.h>
 
 #include <cstdint>
 #include <vector>
@@ -88,22 +91,48 @@ HcclResult InitCcuContext(HcclComm comm) {
 
     const uint32_t numPeers = rankSize - 1;
 
-    // 3. Acquire one channel per peer, ordered by ascending remote rank
-    std::vector<HcclChannelDesc> channelDescs(numPeers);
-    HCCL_CHECK(HcclChannelDescInit(channelDescs.data(), numPeers));
+    // Allocate a small CCU scratch buffer and register it so the channels
+    // have a valid HcclMemHandle to reference. See CANN's
+    // examples/05_custom_ops_allgather for the expected pattern.
+    constexpr uint64_t kCcuScratchBytes = 4096;
+    void *ccuScratch = nullptr;
+    if (aclrtMalloc(&ccuScratch, kCcuScratchBytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        CC_LOG_ERROR("aclrtMalloc for CCU scratch failed: %llu bytes",
+                     (unsigned long long)kCcuScratchBytes);
+        return HCCL_E_INTERNAL;
+    }
+    (void)aclrtMemset(ccuScratch, kCcuScratchBytes, 0, kCcuScratchBytes);
 
-    uint32_t peerIdx = 0;
+    CommMem commMem{COMM_MEM_TYPE_DEVICE, ccuScratch, kCcuScratchBytes};
+    HcclMemHandle memHandle{};
+    HCCL_CHECK(HcclCommMemReg(comm, CTX_TAG, &commMem, &memHandle));
+
+    // Build channelDesc for every link to every remote rank. Each peer may
+    // expose multiple physical links (netLayer=0 gives intra-NUMA links).
+    std::vector<HcclChannelDesc> channelDescs;
     for (uint32_t r = 0; r < rankSize; ++r) {
         if (r == rankId) continue;
-        channelDescs[peerIdx].remoteRank = r;
-        channelDescs[peerIdx].notifyNum  = NOTIFY_COUNT;
-        ++peerIdx;
+        uint32_t linkNum = 0;
+        CommLink *links = nullptr;
+        HCCL_CHECK(HcclRankGraphGetLinks(comm, /*netLayer=*/0, rankId, r, &links, &linkNum));
+        for (uint32_t i = 0; i < linkNum; ++i) {
+            HcclChannelDesc desc{};
+            HcclChannelDescInit(&desc, 1);
+            desc.remoteRank           = r;
+            desc.notifyNum            = NOTIFY_COUNT;
+            desc.memHandles           = &memHandle;
+            desc.memHandleNum         = 1;
+            desc.localEndpoint        = links[i].srcEndpointDesc;
+            desc.remoteEndpoint       = links[i].dstEndpointDesc;
+            desc.channelProtocol      = links[i].linkAttr.linkProtocol;
+            channelDescs.push_back(desc);
+        }
     }
 
-    std::vector<ChannelHandle> channels(numPeers);
+    std::vector<ChannelHandle> channels(channelDescs.size());
     HCCL_CHECK(HcclChannelAcquire(comm, COMM_ENGINE_CCU,
-                                   channelDescs.data(), numPeers,
-                                   channels.data()));
+                                  channelDescs.data(), channelDescs.size(),
+                                  channels.data()));
 
     // 4. Register CCU kernel (compiles Algorithm -> microcode IR)
     HCCL_CHECK(RegisterBatchedAGKernel(comm, &ccuCtx->kernelHandle,
