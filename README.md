@@ -5,6 +5,51 @@ HCCL/HComm, custom_comm provides batched heterogeneous-dtype collective operatio
 as PyTorch custom ops via torch_npu, with full support for eager mode, graph mode
 (torchair GE and aclGraph), and multi-level profiling.
 
+## Architecture
+
+custom_comm ships as two shared libraries, split by `_GLIBCXX_USE_CXX11_ABI`:
+
+    python/custom_comm/
+      libcustom_comm_impl.so   # ABI=0, links libhccl / libhcomm
+      _C.cpython-<ver>.so       # ABI=1, torch extension bindings
+
+The split exists because torch wheels on PyPI are built with the new libstdc++
+CXX11 ABI (`=1`), while CANN's `libhcomm.so` is compiled with the old ABI
+(`=0`). Keeping them in one shared object would corrupt any `std::string` /
+`std::vector` / `std::list` passed across the boundary — see issue #10.
+
+The two libraries communicate only through extern "C" symbols declared in
+`ops/<op>/inc/*.h`. POD types and opaque pointers only; no C++ STL types
+in function signatures.
+
+### Adding a new operator
+
+Three files per operator, all discovered automatically by `setup.py`:
+
+| File                              | Purpose                        | ABI |
+| --------------------------------- | ------------------------------ | --- |
+| `ops/<op>/inc/<op>.h`             | Public C API (extern "C")       | — (POD only) |
+| `ops/<op>/src/**/*.cc`            | Shim implementation            | 0  |
+| `torch_ext/csrc/<op>.cpp`         | Torch binding (op registration) | 1 |
+
+Rules:
+
+- `src/` side can include hcomm/ccu C++ headers freely. Must not include torch.
+- `torch_ext/` side can use torch, c10, ATen. Must only include `ops/<op>/inc/*.h`
+  (the extern-C surface).
+- Directories named `vendor`, `ccu_v2`, `build`, `__pycache__` are skipped.
+
+After dropping files, just `pip install -e .` — `setup.py` picks them up via glob.
+
+### ABI firewall checks
+
+`tests/test_abi_firewall.py` verifies the two-library split stays intact:
+- Shim has zero `__cxx11` symbols (i.e. is built with pre-CXX11 ABI).
+- Shim exports at least one non-mangled T symbol (extern "C" entry point).
+- `_C.so` has `__cxx11` symbols (CXX11 ABI, matches torch).
+- `_C.so` has at least one U symbol that the shim exports as T (real link, not dead code).
+- `_C.so`'s NEEDED includes `libcustom_comm_impl.so` and RUNPATH has `$ORIGIN`.
+
 ## Operators
 
 ### allgather_batch
@@ -66,18 +111,18 @@ torchrun --nproc_per_node=8 example.py
 
 Two execution strategies, selected via environment variable:
 
-### Phase 1: Decomposed (default)
+### decomposed path: Decomposed (default)
 
 Packs all tensors into a contiguous byte buffer, performs a single `HcclAllGather`,
 then unpacks into per-tensor output buffers. Works on all CANN versions.
 
-### Phase 2: CCU Batched
+### CCU path: CCU Batched
 
 Registers a custom CCU kernel that performs multi-descriptor zero-copy RDMA gathers.
 Each descriptor's data is gathered directly into the output buffer without packing or
 copying. Requires CANN 9.0+ and HComm CCU API.
 
-Phase 1 and Phase 2 are both compiled into the extension by default; select the CCU
+decomposed path and CCU path are both compiled into the extension by default; select the CCU
 path at runtime via the `CUSTOM_COMM_USE_CCU` environment variable (no build-time flag):
 
 ```bash
@@ -103,7 +148,7 @@ GE graph optimization passes (operator fusion, memory planning, etc.).
 
 ### aclGraph Capture
 
-For the Phase 2 CCU path, custom_comm supports aclGraph capture. When the main
+For the CCU path CCU path, custom_comm supports aclGraph capture. When the main
 stream enters capture mode (`aclmdlRICaptureBegin`), the operator detects the
 capture state, retrieves the CCU slave stream via `HcclThreadResGetInfo`, and
 registers it into the graph via `rtStreamAddToModel`. This enables CCU kernel
@@ -123,7 +168,7 @@ custom_comm provides profiling hooks at multiple levels:
   `ASCEND_GLOBAL_LOG_LEVEL=1` (INFO) knob; production defaults filter them out.
 - `aclprofMarkEx`: CANN profiler markers. Begin/end markers bracket the entire
   operation and the CCU kernel launch separately, visible in Ascend Insight.
-- **Slave stream events**: When using Phase 2 (CCU), `aclrtEvent` pairs are
+- **Slave stream events**: When using CCU path, `aclrtEvent` pairs are
   recorded on the CCU slave stream, providing precise device-side kernel
   duration measurement independent of host-side timing overhead.
 
@@ -152,14 +197,14 @@ torchrun --nproc_per_node=8 tests/smoke_test.py
 # Meta-only (no NPU, no torchrun): shape inference + converter registration
 pytest tests/ -m "not npu and not dist"
 
-# NPU eager tests: Phase 1 (decomposed) and Phase 2 (CCU).
+# NPU eager tests: decomposed path and CCU path.
 # -m "npu" avoids re-running meta tests on every rank.
 torchrun --nproc_per_node=8 -m pytest tests/allgather_batch/test_eager.py -m npu
 
 # Graph-mode tests: torchair converter + torch.compile + aclGraph capture.
 torchrun --nproc_per_node=8 -m pytest tests/allgather_batch/test_graph.py -m npu
 
-# OPT-AG-04 benchmark (Phase 1 vs Phase 2, switched at runtime)
+# OPT-AG-04 benchmark (decomposed path vs CCU path, switched at runtime)
 torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
 CUSTOM_COMM_USE_CCU=1 torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
 ```

@@ -16,10 +16,32 @@ Target platform: Atlas A5 (Ascend 910_95), CANN 9.0+.
 The first operator is `allgather_batch` -- gather up to 8 heterogeneous-dtype
 tensors in a single collective call. Two execution paths:
 
-- Phase 1 (decomposed): packs tensors into a flat buffer, calls HcclAllGather once, unpacks.
-- Phase 2 (CCU): launches a single CCU kernel for zero-copy RDMA gather per descriptor.
+- decomposed path: packs tensors into a flat buffer, calls HcclAllGather, unpacks.
+- CCU path: launches a single CCU kernel that gathers multiple descs RDMA-style.
 
 Selected at runtime via `CUSTOM_COMM_USE_CCU=1`.
+
+## Build layout (dual-ABI split)
+
+Two shared libraries ship in the Python package:
+
+    python/custom_comm/
+        libcustom_comm_impl.so        # ABI=0 shim (matches libhcomm.so)
+        _C.cpython-*.so               # ABI=1 torch extension (matches torch_npu)
+
+Why: torch / torch_npu wheels are built with `_GLIBCXX_USE_CXX11_ABI=1` while
+CANN's libhcomm.so ships with ABI=0. Any `std::string` / `std::vector`
+crossing a DSO boundary between the two corrupts memory (see issue #10).
+Splitting the code into two libraries, connected only through an
+`extern "C"` + POD-only API, keeps each half on its own ABI.
+
+**Adding a new op (convention auto-picked by setup.py):**
+
+    ops/<op_name>/inc/<op_name>.h         # extern "C" public API (C types only)
+    ops/<op_name>/src/**/*.cc             # shim implementation (ABI=0)
+    torch_ext/csrc/<op_name>.cpp          # torch binding (ABI=1)
+
+Skip folders: `ccu_v2/`, `vendor/`, `build/`, `__pycache__/`.
 
 ## Repository Layout
 
