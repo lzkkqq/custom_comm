@@ -13,7 +13,7 @@
 | Phase 1 INT8+FP32 正确性                         | TestNpuFunctional::test_heterogeneous_int8_fp32         | 待NPU |
 | Phase 1三合一(AG-04/09)                          | TestNpuFunctional::test_three_tensor_pack               | 待NPU |
 | Phase 1重复调用稳定性                            | TestNpuFunctional::test_repeated_calls                  | 待NPU |
-| Phase 2 CCU vs Decomposed                        | TestCcuPath::test_ccu_matches_decomposed                | 待NPU |
+| Phase 2 CCU correctness                          | TestCcuPath::test_ccu_only                              | 待NPU |
 
 ## Graph Mode
 

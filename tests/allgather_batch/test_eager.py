@@ -167,20 +167,24 @@ class TestCcuPath:
         self.device = dist_ctx.device
         self.hcom = dist_ctx.hcom
 
-    def test_ccu_matches_decomposed(self):
-        """CCU output must match decomposed output bit-exactly."""
+    def test_ccu_only(self):
+        """CCU path output matches the expected all-gather of deterministic inputs."""
         import os
         data = (torch.arange(256) + self.rank).to(torch.int8).to(self.device)
-        scale = torch.randn(4, device=self.device, dtype=torch.float32)
+        scale = (torch.arange(4, dtype=torch.float32) + self.rank * 4).to(self.device)
 
-        # Phase 1
-        os.environ.pop("CUSTOM_COMM_USE_CCU", None)
-        out_p1 = torch.ops.custom_comm.allgather_batch([data, scale], self.hcom, self.world_size)
-
-        # Phase 2
         os.environ["CUSTOM_COMM_USE_CCU"] = "1"
-        out_p2 = torch.ops.custom_comm.allgather_batch([data, scale], self.hcom, self.world_size)
-        os.environ.pop("CUSTOM_COMM_USE_CCU", None)
+        try:
+            out_data, out_scale = torch.ops.custom_comm.allgather_batch(
+                [data, scale], self.hcom, self.world_size
+            )
+        finally:
+            os.environ.pop("CUSTOM_COMM_USE_CCU", None)
 
-        assert torch.equal(out_p2[0], out_p1[0])
-        assert torch.equal(out_p2[1], out_p1[1])
+        expected_data = torch.cat([
+            (torch.arange(256) + r).to(torch.int8) for r in range(self.world_size)
+        ]).to(self.device)
+        expected_scale = torch.arange(4 * self.world_size, dtype=torch.float32).to(self.device)
+
+        assert torch.equal(out_data, expected_data)
+        assert torch.equal(out_scale, expected_scale)
