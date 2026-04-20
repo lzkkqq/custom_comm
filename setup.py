@@ -114,6 +114,9 @@ def _compile_one(rel_src: str, obj_dir: str) -> str:
         cxx, "-c",
         "-fPIC", "-std=c++17", "-O2", "-Wall",
         "-D_GLIBCXX_USE_CXX11_ABI=0",
+        # torch_npu 2.9 bundles an older hccl_types.h that uses
+        # HCCL_COMM_HCCL_QOS_CONFIG_NOT_SET; CANN 9.0 uses the shorter
+        # HCCL_COMM_QOS_CONFIG_NOT_SET. Remove this once the upstream is aligned.
         "-DHCCL_COMM_HCCL_QOS_CONFIG_NOT_SET=HCCL_COMM_QOS_CONFIG_NOT_SET",
         "-fvisibility=default",
     ]
@@ -186,6 +189,11 @@ try:
             build_shim()
             super().run()
 
+    # torch_npu 2.7+ wheel ships a bundled hccl_types.h that still uses the
+    # stuttered name HCCL_COMM_HCCL_QOS_CONFIG_NOT_SET. CANN 9.0's SDK
+    # renamed it to HCCL_COMM_QOS_CONFIG_NOT_SET. Alias old to new so torch
+    # bindings still compile when they transitively include torch_npu's copy.
+    # Drop this when torch_npu ships headers matching CANN 9.0.
     _binding_macros = [
         ("HCCL_COMM_HCCL_QOS_CONFIG_NOT_SET", "HCCL_COMM_QOS_CONFIG_NOT_SET"),
     ]
