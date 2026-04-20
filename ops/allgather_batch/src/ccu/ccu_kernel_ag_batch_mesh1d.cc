@@ -1,7 +1,7 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// CCU Kernel: Batched AllGather on Mesh-1D topology (Phase 2, zero-copy).
+// CCU Kernel: Batched AllGather on Mesh-1D topology (CCU path, zero-copy).
 //
 // For each active descriptor, WriteNb to every remote rank's recvBuf and
 // LocalCopyNb for the self-rank slot.  All descriptors are serialized

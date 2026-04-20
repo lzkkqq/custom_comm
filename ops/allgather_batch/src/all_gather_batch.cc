@@ -20,7 +20,7 @@
 extern "C" int rtStreamAddToModel(void *stream, void *model);
 #endif
 
-// Phase 1 decomposed strategy (decomposed_strategy.cc)
+// decomposed path decomposed strategy (decomposed_strategy.cc)
 namespace custom_comm {
 HcclResult DecomposedAllGatherBatch(
     const HcclAllGatherDesc *descs, uint32_t descCount,
@@ -51,7 +51,7 @@ static HcclResult ValidateParams(
 }
 
 // ============================================================
-// Environment variable check for Phase 2 CCU path
+// Environment variable check for CCU path CCU path
 // ============================================================
 
 static bool UseCcuPath() {
@@ -95,11 +95,11 @@ static HcclResult HcclAllGatherBatchImpl(
     aclrtStream stream) {
 
     if (UseCcuPath()) {
-        // Phase 2: CCU batched zero-copy AllGather
+        // CCU path: CCU batched zero-copy AllGather
         uint32_t rankSize = 0;
         HCCL_CHECK(HcclGetRankSize(comm, &rankSize));
         if (rankSize <= 1) {
-            // Single rank: no peers to exchange with, use Phase 1 self-copy
+            // Single rank: no peers to exchange with, use decomposed path self-copy
             return custom_comm::DecomposedAllGatherBatch(
                 descs, descCount, comm, stream);
         }
@@ -142,7 +142,7 @@ static HcclResult HcclAllGatherBatchImpl(
 
         ProfMark("custom_comm::ccu_launch::begin", stream);
 
-        // Phase 2 CCU kernel launch with optional slave stream profiling
+        // CCU path CCU kernel launch with optional slave stream profiling
         HcclResult result;
 #ifndef __APPLE__
         // If slave stream available, record events for precise device timing
@@ -174,7 +174,7 @@ static HcclResult HcclAllGatherBatchImpl(
         return result;
     }
 
-    // Phase 1: decomposed byte-packing strategy
+    // decomposed path: decomposed byte-packing strategy
     return custom_comm::DecomposedAllGatherBatch(descs, descCount, comm, stream);
 }
 

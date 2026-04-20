@@ -5,8 +5,8 @@
 
 Layered as:
   TestMetaKernel     — Meta-dispatch shape inference (no NPU)
-  TestNpuFunctional  — Phase 1 decomposed HCCL path (needs NPU + torchrun)
-  TestCcuPath        — Phase 2 CCU kernel path (needs NPU + torchrun, CUSTOM_COMM_USE_CCU=1)
+  TestNpuFunctional  — decomposed path decomposed HCCL path (needs NPU + torchrun)
+  TestCcuPath        — CCU path CCU kernel path (needs NPU + torchrun, CUSTOM_COMM_USE_CCU=1)
 
 Graph-mode counterpart: ./test_graph.py
 Performance numbers:    ./bench.py
@@ -98,7 +98,7 @@ class TestMetaKernel:
 @pytest.mark.ext
 @pytest.mark.dist
 class TestNpuFunctional:
-    """Phase 1 (decomposed) eager-mode correctness on NPU.
+    """decomposed path eager-mode correctness on NPU.
 
     Run: torchrun --nproc_per_node=N pytest tests/ -k TestNpuFunctional
     """
@@ -151,14 +151,14 @@ class TestNpuFunctional:
 
 
 # ============================================================
-# CCU path tests (Phase 2, CUSTOM_COMM_USE_CCU=1)
+# CCU path tests (CCU path, CUSTOM_COMM_USE_CCU=1)
 # ============================================================
 
 @pytest.mark.npu
 @pytest.mark.ext
 @pytest.mark.dist
 class TestCcuPath:
-    """Phase 2 CCU kernel tests. Run with CUSTOM_COMM_USE_CCU=1."""
+    """CCU path CCU kernel tests. Run with CUSTOM_COMM_USE_CCU=1."""
 
     @pytest.fixture(autouse=True)
     def _bind(self, dist_ctx):

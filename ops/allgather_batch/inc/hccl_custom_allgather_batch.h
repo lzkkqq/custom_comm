@@ -1,7 +1,7 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// FROZEN CONTRACT -- do not change after Phase 1 ships.
+// FROZEN CONTRACT -- do not change after decomposed path ships.
 
 #ifndef CUSTOM_COMM_ALLGATHER_BATCH_H_
 #define CUSTOM_COMM_ALLGATHER_BATCH_H_
@@ -33,10 +33,10 @@ typedef struct {
 // ============================================================
 
 // Semantically equivalent to descCount independent HcclAllGather calls,
-// but executed as a single operation (Phase 2: single CCU kernel).
+// but executed as a single operation (CCU path: single CCU kernel).
 //
-// Phase dispatch: if env CUSTOM_COMM_USE_CCU == "1", takes Phase 2 (CCU) path;
-// otherwise takes Phase 1 (decomposed byte-packing) path.
+// Phase dispatch: if env CUSTOM_COMM_USE_CCU == "1", takes CCU path path;
+// otherwise takes decomposed path (decomposed byte-packing) path.
 //
 // Constraints:
 //   - 1 <= descCount <= MAX_DESC_COUNT (8)

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Phase 2: CCU context management -- one-time registration + cached launch.
+// CCU path: CCU context management -- one-time registration + cached launch.
 //
 // InitCcuContext: HcclEngineCtxCreate -> HcclChannelAcquire -> CcuKernelRegister
 //                 -> HcclThreadAcquire -> KernelRegisterFinish  (first call)

@@ -13,7 +13,7 @@
 // Constants
 // ============================================================
 
-constexpr uint32_t MAX_DESC_COUNT = 8;
+constexpr uint32_t MAX_DESC_COUNT = 6;
 
 // ============================================================
 // Error checking macros (CHK_RET style, ref-survey.md:68-79)
@@ -61,7 +61,7 @@ inline uint64_t DtypeSize(HcclDataType dtype) {
 }
 
 // ============================================================
-// CCU task argument (Phase 2 data structure, frozen contract)
+// CCU task argument (CCU path data structure, frozen contract)
 // ============================================================
 
 #include "hccl_custom_allgather_batch.h"

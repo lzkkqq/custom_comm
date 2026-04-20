@@ -1,14 +1,14 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Phase 1 decomposed strategy:
+// decomposed path decomposed strategy:
 //   1. Compute total bytes across all descs
 //   2. Allocate packed send buffer, memcpy each desc's sendBuf into it
 //   3. Allocate gathered recv buffer (totalBytes * worldSize)
 //   4. Single HcclAllGatherInner(packed, gathered, totalBytes, UINT8, comm, stream)
 //   5. Copy each rank-i slice back to the corresponding desc's recvBuf
 //
-// This is the correctness oracle -- Phase 2 CCU output is verified bit-exact
+// This is the correctness oracle -- CCU path CCU output is verified bit-exact
 // against this path.
 
 #include "hccl_custom_allgather_batch.h"
