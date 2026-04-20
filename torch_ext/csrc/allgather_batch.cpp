@@ -11,7 +11,7 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "hccl_custom_allgather_batch.h"
+#include "allgather_batch.h"
 #include "common.h"
 #include "log_util.h"
 

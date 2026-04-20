@@ -64,7 +64,7 @@ inline uint64_t DtypeSize(HcclDataType dtype) {
 // CCU task argument (CCU path data structure, frozen contract)
 // ============================================================
 
-#include "hccl_custom_allgather_batch.h"
+#include "allgather_batch.h"
 
 namespace custom_comm {
 

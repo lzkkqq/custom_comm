@@ -1,7 +1,7 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "hccl_custom_allgather_batch.h"
+#include "allgather_batch.h"
 #include "common.h"
 #include "log_util.h"
 

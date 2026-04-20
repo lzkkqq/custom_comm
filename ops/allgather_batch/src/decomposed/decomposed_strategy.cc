@@ -11,7 +11,7 @@
 // This is the correctness oracle -- CCU path CCU output is verified bit-exact
 // against this path.
 
-#include "hccl_custom_allgather_batch.h"
+#include "allgather_batch.h"
 #include "common.h"
 #include "log_util.h"
 

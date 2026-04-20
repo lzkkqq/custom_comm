@@ -113,5 +113,5 @@ Connection and environment:
 - CANN 9.0 SDK required (headers in `include/hccl/`, `pkg_inc/`, runtime in `x86_64-linux/lib64/`)
 - torch_npu NpuExtension injects its own ACL headers; do NOT add `${SDK}/include` broadly to
   setup.py include_dirs -- only `include/hccl/`, `include/hcomm/`, `pkg_inc/`
-- `hccl_custom_allgather_batch.h` uses forward-declared `aclrtStream` (not `#include <acl/acl_base_rt.h>`)
+- `allgather_batch.h` uses forward-declared `aclrtStream` (not `#include <acl/acl_base_rt.h>`)
   to avoid conflicts with torch_npu's bundled ACL headers
