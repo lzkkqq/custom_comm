@@ -1,37 +1,35 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// CCU MS (MultiShot / LoopGroup) kernel for allgather_batch on mesh1d.
-//
-// Scaffold: defines the kernel arg + kernel class that register via the
-// public hcomm CcuKernel API, plus the helper entry points used by the
-// ccu_ms engine context. The Algorithm() body is intentionally empty here
-// (no microcode emitted) -- it is filled in by the follow-up commit once
-// the SCHED baseline has landed. Until that point any Launch at runtime
-// will return HCCL_E_NOT_SUPPORT via engine_ctx_ms.cc.
+// MS (MultiShot LoopGroup) variant of the batched AllGather CCU kernel.
+// Scaffold: defines the CcuKernelArg/CcuKernel subclasses and the helper
+// entry points Register/Launch that the engine context calls. The real
+// LoopBlock-based Algorithm() body lands in a later commit; for now the
+// kernel returns HCCL_E_NOT_SUPPORT at register time to keep the
+// scaffolding honest.
 
 #include "ccu_ms/ccu_kernel_ag_batch_mesh1d_ms.h"
 
 #include "common.h"
 #include "log_util.h"
 
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
+
 #include <hccl/hccl_types.h>
 #include <hcomm/ccu/ccu_kernel.h>
 #include <hcomm/ccu/ccu_kernel_arg.h>
 #include <hcomm/ccu/ccu_kernel_signature.h>
-#include <hcomm/ccu/ccu_task_arg_v1.h>
 #include <hcomm/ccu/hccl_ccu_res.h>
-
-#include <cstdint>
-#include <memory>
-#include <vector>
 
 namespace custom_comm {
 namespace ms {
 
-// ============================================================
-// Argument class: what the factory receives from engine_ctx.
-// ============================================================
+// -----------------------------------------------------------------------
+// Argument bundle passed at kernel registration time.
+// -----------------------------------------------------------------------
 class CcuKernelArgAgBatchMs : public hcomm::CcuKernelArg {
 public:
     CcuKernelArgAgBatchMs(uint32_t rankId, uint32_t rankSize,
@@ -51,77 +49,52 @@ public:
     uint32_t rankSize_;
 };
 
-// ============================================================
-// Per-invocation task arg (addresses + per-desc byte counts).
-// Matches the SCHED variant's layout so both share AllGatherBatchTaskArg.
-// ============================================================
-struct CcuTaskArgMs : public hcomm::CcuTaskArg {
-    uint32_t descCount;
-    uint64_t token;
-    uint64_t sendAddr[MAX_DESC_COUNT];
-    uint64_t recvAddr[MAX_DESC_COUNT];
-    uint64_t sendBytes[MAX_DESC_COUNT];
-    uint64_t selfOffset[MAX_DESC_COUNT];
-};
-
-// ============================================================
-// CCU MS kernel class
-// ============================================================
-class CcuKernelAgBatchMesh1dMs : public hcomm::CcuKernel {
+// ----------------------------------------------------------------
+// CCU kernel class (MS variant)
+// ----------------------------------------------------------------
+class CcuKernelAgBatchMs : public hcomm::CcuKernel {
 public:
-    explicit CcuKernelAgBatchMesh1dMs(const hcomm::CcuKernelArg &arg)
-        : hcomm::CcuKernel(arg)
-    {
-        const auto &argMs = static_cast<const CcuKernelArgAgBatchMs &>(arg);
-        rankId_   = argMs.rankId_;
-        rankSize_ = argMs.rankSize_;
-    }
+    explicit CcuKernelAgBatchMs(const hcomm::CcuKernelArg &arg)
+        : hcomm::CcuKernel(arg),
+          rankId_(static_cast<const CcuKernelArgAgBatchMs &>(arg).rankId_),
+          rankSize_(static_cast<const CcuKernelArgAgBatchMs &>(arg).rankSize_)
+    {}
 
-protected:
-    // Skeleton: real MS LoopGroup microcode lands in the follow-up commit.
+ protected:
     HcclResult Algorithm() override {
-        CC_LOG_INFO("[CcuKernelAgBatchMesh1dMs] Algorithm skeleton; returning E_NOT_SUPPORT");
+        CC_LOG_ERROR("ccu_ms Algorithm not implemented yet (rank=%u size=%u)",
+                     rankId_, rankSize_);
         return HCCL_E_NOT_SUPPORT;
     }
 
-    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg & /*arg*/) override {
+    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &) override {
         return {};
     }
 
-private:
+ private:
     uint32_t rankId_{0};
     uint32_t rankSize_{0};
 };
 
-// ============================================================
-// Factory for HcclCcuKernelRegister
-// ============================================================
+// Factory used by HCCL to instantiate kernel objects.
 static std::unique_ptr<hcomm::CcuKernel>
-MakeCcuKernelAgBatchMesh1dMs(const hcomm::CcuKernelArg &arg)
-{
-    return std::make_unique<CcuKernelAgBatchMesh1dMs>(arg);
+MakeCcuKernelAgBatchMs(const hcomm::CcuKernelArg &arg) {
+    return std::make_unique<CcuKernelAgBatchMs>(arg);
 }
-
-// ============================================================
-// Public entry points (declared in ccu_kernel_ag_batch_mesh1d_ms.h)
-// ============================================================
 
 HcclResult RegisterBatchedAGKernelMs(HcclComm comm, CcuKernelHandle *handle,
                                      uint32_t rankId, uint32_t rankSize,
-                                     const std::vector<ChannelHandle> &channels)
-{
+                                     const std::vector<ChannelHandle> &channels) {
     CcuKernelArgAgBatchMs arg(rankId, rankSize, channels);
-    hcomm::KernelCreator creator = &MakeCcuKernelAgBatchMesh1dMs;
+    hcomm::KernelCreator creator = MakeCcuKernelAgBatchMs;
     return HcclCcuKernelRegister(comm, handle, &creator, &arg);
 }
 
 HcclResult LaunchBatchedAGKernelMs(HcclComm comm, ThreadHandle thread,
                                    CcuKernelHandle kernel,
                                    const AllGatherBatchTaskArg &taskArg) {
-    // Placeholder: fail fast; will be replaced with real task-arg marshal in
-    // the follow-up commit.
     (void)comm; (void)thread; (void)kernel; (void)taskArg;
-    CC_LOG_ERROR("LaunchBatchedAGKernelMs: not implemented yet");
+    CC_LOG_ERROR("LaunchBatchedAGKernelMs: not yet implemented");
     return HCCL_E_NOT_SUPPORT;
 }
 
