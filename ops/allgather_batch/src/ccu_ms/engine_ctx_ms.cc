@@ -1,73 +1,42 @@
 // Copyright (c) 2026 custom_comm Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// CCU MS backend engine context.
+// Engine context for the MS (LoopGroup MultiSlot) CCU backend.
 //
-// Mirrors ccu_sched/engine_ctx.cc but:
-//   * Uses the MS kernel (RegisterBatchedAGKernelMs from ccu_ms/) instead of
-//     the SCHED variant.
-//   * Distinct ctx tag so SCHED and MS can coexist on the same comm.
+// Mirror of ccu_sched/engine_ctx.cc: manages the per-comm channel/kernel
+// cache that InitCcuContext fills and LaunchCcuKernel consumes. Uses a
+// distinct CTX tag so both CCU_MODEs may co-exist on the same comm.
 //
-// The MS kernel itself is still a skeleton (Algorithm() returns HCCL_E_NOT_SUPPORT),
-// so calls that reach here will propagate that error to the caller.
+// Present impl is a placeholder — returns HCCL_E_NOT_SUPPORT from every
+// entry point until the MS kernel body (Algorithm) is implemented. The
+// dispatcher in ccu_dispatch.cc routes to these stubs only when the user
+// sets CUSTOM_COMM_CCU_MODE=ms; SCHED remains the default path.
 
 #include "ccu_ms/engine_ctx_ms.h"
-#include "ccu_ms/ccu_kernel_ag_batch_mesh1d_ms.h"
+
 #include "common.h"
 #include "log_util.h"
 
-#include <hccl/hccl_comm.h>
-#include <hccl/hccl_rank_graph.h>
-#include <hccl/hccl_res.h>
-#include <hcomm/ccu/ccu_kernel.h>
-#include <hcomm/ccu/hccl_ccu_res.h>
-
-#include <acl/acl.h>
-
-#include <cstdint>
-#include <vector>
+#include <hccl/hccl_types.h>
 
 namespace custom_comm {
 namespace ms {
 
-static constexpr const char *CTX_TAG_MS = "custom_comm_ag_batch_ms";
-
-// XN slots required: token(1) + MAX_DESC_COUNT recv addrs + post-sync(1).
-// Matches SCHED so the two paths can co-exist.
-static constexpr uint32_t NOTIFY_COUNT = 1 + MAX_DESC_COUNT + 1;
-
-namespace {
-struct CcuContextMs {
-    CcuKernelHandle kernelHandle{};
-    ThreadHandle    threadHandle{};
-    bool            initialized{false};
-};
-
-CcuContextMs *LookupCtx(HcclComm comm) {
-    void *ctx = nullptr;
-    uint64_t ctxSize = 0;
-    if (HcclEngineCtxGet(comm, CTX_TAG_MS, COMM_ENGINE_CCU, &ctx, &ctxSize) == HCCL_SUCCESS) {
-        return static_cast<CcuContextMs *>(ctx);
-    }
-    return nullptr;
-}
-
-}  // namespace
-
 HcclResult InitCcuContext(HcclComm comm) {
     (void)comm;
-    CC_LOG_ERROR("ccu_ms::InitCcuContext: not yet implemented");
+    CC_LOG_ERROR("ccu_ms::InitCcuContext: MS backend not yet implemented");
     return HCCL_E_NOT_SUPPORT;
 }
 
 HcclResult LaunchCcuKernel(HcclComm comm, const void *taskArg) {
     (void)comm; (void)taskArg;
+    CC_LOG_ERROR("ccu_ms::LaunchCcuKernel: MS backend not yet implemented");
     return HCCL_E_NOT_SUPPORT;
 }
 
 HcclResult GetCcuThreadHandle(HcclComm comm, uint64_t *threadHandle) {
     (void)comm;
-    if (threadHandle) *threadHandle = 0;
+    if (threadHandle != nullptr) *threadHandle = 0;
     return HCCL_E_NOT_SUPPORT;
 }
 
