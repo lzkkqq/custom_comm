@@ -370,10 +370,15 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
             selfDst[d].addr += selfOffset[d];
             selfDst[d].token = token;
 
-            // Peer dests: peerRecvAddr[p][d] + rankOffset
-            std::vector<RemoteAddr> peerDsts(numPeers);
+            // Peer dests: peerRecvAddr[p][d] + rankOffset.  Construct via
+            // push_back so each slot is copy-initialized from a context-bearing
+            // remoteDst element; a default-constructed RemoteAddr has null
+            // context and any subsequent operator= would emit ASSIGN reps with
+            // a null context, tripping AppendToContext().
+            std::vector<RemoteAddr> peerDsts;
+            peerDsts.reserve(numPeers);
             for (uint32_t p = 0; p < numPeers; ++p) {
-                peerDsts[p] = remoteDst[p * MAX_DESC_COUNT + d];
+                peerDsts.push_back(remoteDst[p * MAX_DESC_COUNT + d]);
                 peerDsts[p].addr  = peerRecvAddr[p * MAX_DESC_COUNT + d];
                 peerDsts[p].addr += selfOffset[d];
                 peerDsts[p].token = peerToken[p];
