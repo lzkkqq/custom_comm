@@ -163,6 +163,7 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     using CcuRep::LocalAddr;
     using CcuRep::RemoteAddr;
     using CcuRep::CompletedEvent;
+    using CcuRep::CcuBuf;
 
     const uint32_t numPeers = rankSize_ - 1;
 
@@ -256,6 +257,20 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     // Single CompletedEvent tracks all WriteNb/LocalCopyNb completions
     CompletedEvent event = CreateCompletedEvent();
 
+    // Phase 2b-α: Allocate on-chip CcuBuf staging area per descriptor.
+    // Each CcuBuf is a CCU_MS_SIZE-wide on-chip slot (see hcomm/ccu/
+    // ccu_microcode_v1.h: CCU_MS_SIZE = 4096).  Routing data through
+    // a CcuBuf is what makes the CCU translator emit TransLocMemToLocMS /
+    // TransLocMSToRmtMem instructions -- the actual "MS" code path.
+    //
+    // Limitation: each slot currently only holds CCU_MS_SIZE bytes, so
+    // callers sending more than 4 KiB per desc will hit an overflow
+    // until Phase 2b-γ wires in CreateBlockCcuBuf(N) + LoopGroupCall to
+    // tile the slots.  The test harness uses 256 B / 16 B descs so this
+    // is OK for the smoke probe.
+    std::vector<CcuBuf> stagingBuf(MAX_DESC_COUNT);
+    CreateBlockCcuBuf(MAX_DESC_COUNT, stagingBuf.data());
+
     // ================================================================
     // LoadArgs: bind each Variable to the next GeneArgs slot.
     // Order must exactly match GeneArgs encoding above.
@@ -288,8 +303,14 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     }
 
     // ================================================================
-    // DoAllGather: for each active desc, WriteNb to every peer's
-    // recvBuf at selfOffset, then LocalCopyNb for our own slot.
+    // DoAllGather (Phase 2b-alpha):
+    //   local HBM --LocalCopyNb-->  CcuBuf (LocMS staging) --> peers
+    //                                      +---LocalCopyNb--> self recvBuf
+    //
+    // Routing through CcuBuf causes the CCU microcode lowering to emit
+    // TransLocMemToLocMS + TransLocMsToRmtMem + TransLocMsToLocMem
+    // instructions, which is the real "MS" data path that logs will show.
+    // Still 1-slot, no LoopGroupCall — no parallel fan-out yet.
     // ================================================================
 
     for (uint32_t d = 0; d < MAX_DESC_COUNT; ++d) {
@@ -298,20 +319,24 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
             localSrc[d].addr  = sendAddr[d];
             localSrc[d].token = token;
 
-            // WriteNb to each peer
+            // Stage HBM -> on-chip LocMS buffer for this desc.
+            LocalCopyNb(stagingBuf[d], localSrc[d], sendBytes[d], event);
+            WaitEvent(event);
+
+            // Fan-out LocMS -> each peer's recvBuf[d] at selfOffset
             for (uint32_t p = 0; p < numPeers; ++p) {
                 RemoteAddr &dst = remoteDst[p * MAX_DESC_COUNT + d];
                 dst.addr  = peerRecvAddr[p * MAX_DESC_COUNT + d];
                 dst.addr += selfOffset[d];
                 dst.token = peerToken[p];
-                WriteNb(channels_[p], dst, localSrc[d], sendBytes[d], event);
+                WriteNb(channels_[p], dst, stagingBuf[d], sendBytes[d], event);
             }
 
-            // Self-copy: our sendBuf -> our recvBuf[rankId]
+            // Self-copy LocMS -> own recvBuf[rankId]
             selfDst[d].addr  = recvAddr[d];
             selfDst[d].addr += selfOffset[d];
             selfDst[d].token = token;
-            LocalCopyNb(selfDst[d], localSrc[d], sendBytes[d], event);
+            LocalCopyNb(selfDst[d], stagingBuf[d], sendBytes[d], event);
         }
     }
 
