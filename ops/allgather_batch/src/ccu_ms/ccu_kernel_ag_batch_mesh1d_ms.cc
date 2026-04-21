@@ -11,6 +11,8 @@
 //            ccu_kernel_all_gather_mesh1d_mem2mem.{h,cc}
 
 #include "common.h"
+#include "ccu_ms/go_size.h"
+#include "log_util.h"
 
 #include <hcomm/ccu/ccu_kernel.h>
 #include <hcomm/ccu/ccu_kernel_signature.h>
@@ -19,8 +21,12 @@
 #include <hcomm/ccu/ccu_condition_v1.h>
 #include <hcomm/ccu/ccu_assist_pub.h>
 #include <hcomm/ccu/hccl_ccu_res.h>
+#include <hcomm/ccu/ccu_loopblock_v1.h>
+#include <hcomm/ccu/ccu_loopgroupcall_v1.h>
+#include <hcomm/ccu/ccu_microcode_v1.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -161,9 +167,47 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     const uint32_t numPeers = rankSize_ - 1;
 
     // ================================================================
+    // Phase 2b diagnostic: log the microcode-arg bit patterns CalGoSize
+    // would produce for representative payload sizes, plus DSL call-site
+    // constants.  Opt-in via CUSTOM_COMM_CCU_MS_DIAG=1 to avoid
+    // polluting logs during normal runs.
+    // ================================================================
+    if (const char *diag = std::getenv("CUSTOM_COMM_CCU_MS_DIAG");
+        diag && diag[0] == '1') {
+        CC_LOG_INFO("[ms-diag] Algorithm() entered: rankId=%u rankSize=%u "
+                    "numPeers=%u MAX_DESC=%u",
+                    rankId_, rankSize_, numPeers, MAX_DESC_COUNT);
+        CC_LOG_INFO("[ms-diag] constants: CCU_MS_SIZE=%llu CCU_MS_INTERLEAVE=%llu "
+                    "CCU_MS_DEFAULT_LOOP_COUNT=%llu",
+                    static_cast<unsigned long long>(kCcuMsSize),
+                    static_cast<unsigned long long>(kCcuMsInterleave),
+                    static_cast<unsigned long long>(kCcuMsDefaultLoopCount));
+
+        // Probe CalGoSize output at canonical sizes so we can diff against
+        // HCCL's values in a known-good mesh1d run on the same rank.
+        for (uint64_t sz : {uint64_t{4096},        // 1 slot
+                            uint64_t{32768},       // 8 slots
+                            uint64_t{262144},      // 64 slots, 1 iter
+                            uint64_t{524288},      // 128 slots, 2 iter
+                            uint64_t{4 * 1024 * 1024}}) {  // 4 MiB
+            GoSize g = CalGoSize(sz);
+            CC_LOG_INFO("[ms-probe] CalGoSize(%llu) -> addrOffset=0x%llx "
+                        "loopParam=0x%llx parallelParam=0x%llx residual=%llu",
+                        static_cast<unsigned long long>(sz),
+                        static_cast<unsigned long long>(g.addrOffset),
+                        static_cast<unsigned long long>(g.loopParam),
+                        static_cast<unsigned long long>(g.parallelParam),
+                        static_cast<unsigned long long>(g.residual));
+        }
+        CC_LOG_INFO("[ms-diagnose] rank=%u rankSize=%u numPeers=%u "
+                    "MAX_DESC_COUNT=%u; Algorithm about to emit DSL",
+                    rankId_, rankSize_, numPeers, MAX_DESC_COUNT);
+    }
+
+    // ================================================================
     // InitResource: create all DSL resources upfront (before any
-    // conditional microcode).  Each Create* call registers a resource
-    // slot in the CcuRep IR.
+    // CCU_IF).  Each Create* call registers a resource slot in the
+    // CcuRep IR.
     // ================================================================
 
     // --- GeneArgs Variables (33 total, loaded from SQE in order) ---
@@ -319,6 +363,10 @@ HcclResult RegisterBatchedAGKernelMs(
     uint32_t rankId, uint32_t rankSize,
     const std::vector<ChannelHandle> &channels)
 {
+    if (const char *v = std::getenv("CUSTOM_COMM_CCU_MS_DIAG"); v && v[0] == '1') {
+        CC_LOG_INFO("[MS] RegisterBatchedAGKernelMs: rankId=%u rankSize=%u channels=%zu",
+                    rankId, rankSize, channels.size());
+    }
     CcuKernelArgBatchMs arg(rankSize, rankId, channels);
     hcomm::KernelCreator creator = CreateKernel;
     return HcclCcuKernelRegister(comm, handle, &creator, &arg);
@@ -329,29 +377,50 @@ HcclResult LaunchBatchedAGKernelMs(
     const AllGatherBatchTaskArg &taskArg)
 {
     CcuTaskArgBatchMs ccuArg{};
-
     ccuArg.descCount = taskArg.descCount;
+
+    const bool diag = []() {
+        const char *v = std::getenv("CUSTOM_COMM_CCU_MS_DIAG");
+        return v != nullptr && v[0] == '1';
+    }();
+
     for (uint32_t d = 0; d < taskArg.descCount; ++d) {
         uint64_t elemSize = DtypeSize(taskArg.descs[d].dataType);
-        if (elemSize == 0 || taskArg.descs[d].sendCount > UINT64_MAX / elemSize) {
+        if (elemSize == 0 ||
+            taskArg.descs[d].sendCount > UINT64_MAX / elemSize) {
             return HCCL_E_PARA;
         }
-        uint64_t bytes    = taskArg.descs[d].sendCount * elemSize;
+        uint64_t bytes       = taskArg.descs[d].sendCount * elemSize;
         ccuArg.sendAddr[d]   = reinterpret_cast<uint64_t>(taskArg.descs[d].sendBuf);
         ccuArg.recvAddr[d]   = reinterpret_cast<uint64_t>(taskArg.descs[d].recvBuf);
         ccuArg.sendBytes[d]  = bytes;
         ccuArg.selfOffset[d] = static_cast<uint64_t>(taskArg.rankId) * bytes;
-    }
-    // Unused slots already zeroed by value-init
 
-    // RDMA token from first active desc (skip zero-length descs to avoid
-    // passing size=0 to GetTokenInfo)
+        if (diag) {
+            GoSize gs = CalGoSize(bytes);
+            CC_LOG_INFO("[ms-diag] desc=%u bytes=%llu -> goSize{addrOff=0x%llx "
+                        "loopParam=0x%llx parallelParam=0x%llx residual=%llu}",
+                        d, static_cast<unsigned long long>(bytes),
+                        static_cast<unsigned long long>(gs.addrOffset),
+                        static_cast<unsigned long long>(gs.loopParam),
+                        static_cast<unsigned long long>(gs.parallelParam),
+                        static_cast<unsigned long long>(gs.residual));
+        }
+    }
+
+    // RDMA token from first active desc (skip zero-length descs to avoid size=0)
     for (uint32_t d = 0; d < taskArg.descCount; ++d) {
         if (ccuArg.sendBytes[d] > 0) {
             ccuArg.token = hcomm::CcuRep::GetTokenInfo(
                 ccuArg.sendAddr[d], ccuArg.sendBytes[d]);
             break;
         }
+    }
+
+    if (diag) {
+        CC_LOG_INFO("[MS] launching kernel: rank=%u descCount=%u token=0x%llx",
+                    taskArg.rankId, taskArg.descCount,
+                    static_cast<unsigned long long>(ccuArg.token));
     }
 
     return HcclCcuKernelLaunch(comm, thread, kernel, &ccuArg);
