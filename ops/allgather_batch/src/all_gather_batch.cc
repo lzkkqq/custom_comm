@@ -5,7 +5,7 @@
 #include "common.h"
 #include "log_util.h"
 
-#include "ccu_sched/engine_ctx.h"
+#include "ccu_dispatch.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -104,7 +104,7 @@ static HcclResult HcclAllGatherBatchImpl(
                 descs, descCount, comm, stream);
         }
 
-        HCCL_CHECK(custom_comm::InitCcuContext(comm));
+        HCCL_CHECK(custom_comm::DispatchInitCcuContext(comm));
 
 #ifndef __APPLE__
         // aclGraph capture: register CCU slave stream into the capture model
@@ -116,7 +116,7 @@ static HcclResult HcclAllGatherBatchImpl(
             if (aclRet == ACL_SUCCESS &&
                 captureStatus == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && rtModel != nullptr) {
                 uint64_t threadHandle = 0;
-                HCCL_CHECK(custom_comm::GetCcuThreadHandle(comm, &threadHandle));
+                HCCL_CHECK(custom_comm::DispatchGetCcuThreadHandle(comm, &threadHandle));
                 aclrtStream slaveStream = nullptr;
                 uint32_t len = sizeof(slaveStream);
                 HCCL_CHECK(HcclThreadResGetInfo(
@@ -148,7 +148,7 @@ static HcclResult HcclAllGatherBatchImpl(
         // If slave stream available, record events for precise device timing
         uint64_t threadHandle = 0;
         aclrtStream slaveStream = nullptr;
-        if (custom_comm::GetCcuThreadHandle(comm, &threadHandle) == HCCL_SUCCESS
+        if (custom_comm::DispatchGetCcuThreadHandle(comm, &threadHandle) == HCCL_SUCCESS
             && threadHandle != 0) {
             uint32_t infoLen = sizeof(aclrtStream);
             HcclThreadResGetInfo(comm, threadHandle, THREAD_RES_TYPE_STREAM,
@@ -159,7 +159,7 @@ static HcclResult HcclAllGatherBatchImpl(
             aclrtCreateEvent(&startEvt);
             aclrtCreateEvent(&endEvt);
             aclrtRecordEvent(startEvt, slaveStream);
-            result = custom_comm::LaunchCcuKernel(comm, &taskArg);
+            result = custom_comm::DispatchLaunchCcuKernel(comm, &taskArg);
             aclrtRecordEvent(endEvt, slaveStream);
             // Events can be queried later for elapsed time via aclrtEventElapsedTime
             aclrtDestroyEvent(startEvt);
@@ -167,7 +167,7 @@ static HcclResult HcclAllGatherBatchImpl(
         } else
 #endif
         {
-            result = custom_comm::LaunchCcuKernel(comm, &taskArg);
+            result = custom_comm::DispatchLaunchCcuKernel(comm, &taskArg);
         }
 
         ProfMark("custom_comm::ccu_launch::end", stream);
