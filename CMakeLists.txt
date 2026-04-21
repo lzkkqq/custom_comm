@@ -5,29 +5,27 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ---- SDK discovery ----
-include(cmake/FindCANN.cmake)
+# ---------------------------------------------------------------------------
+# CMake here is ONLY for local syntax/static check on Mac.
+# The real build is driven by setup.py (which globs sources itself).
+# ---------------------------------------------------------------------------
 
-# ---- C API library ----
-add_library(custom_comm_ops SHARED
-    ops/allgather_batch/src/all_gather_batch.cc
-    ops/allgather_batch/src/ccu_kernel_ag_batch_mesh1d.cc
-    ops/allgather_batch/src/decomposed_strategy.cc
-    ops/allgather_batch/src/engine_ctx.cc
-)
+include(cmake/FindCANN.cmake OPTIONAL)
+
+# Glob all C++ sources under ops/ (matches setup.py convention).
+file(GLOB_RECURSE CUSTOM_COMM_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/*.cc")
+
+add_library(custom_comm_ops SHARED ${CUSTOM_COMM_SOURCES})
 
 target_include_directories(custom_comm_ops PRIVATE
-    ops/allgather_batch/inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/ops/allgather_batch/inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/ops/allgather_batch/src
     ${CANN_INCLUDE_DIRS}
-    ${CANN_CCU_INCLUDE_DIRS}
-    ${CANN_ACL_INCLUDE_DIRS}
+    ${CANN_PKG_INC_DIRS}
 )
 
-if(CANN_LIBRARIES)
-    target_link_libraries(custom_comm_ops PRIVATE ${CANN_LIBRARIES})
-endif()
-
-# On macOS, allow unresolved symbols (syntax-check only, no runtime)
 if(APPLE)
     target_link_options(custom_comm_ops PRIVATE -undefined dynamic_lookup)
 endif()
