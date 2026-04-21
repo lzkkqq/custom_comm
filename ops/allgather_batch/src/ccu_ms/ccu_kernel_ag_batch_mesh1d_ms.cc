@@ -328,19 +328,8 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
         NotifyWait(channels_[p], CKE_IDX, 1u << POST_SYNC_XN_ID);
     }
 
-    // Register this kernel with the CCU profiling subsystem so that
-    // MindStudio Insight associates the CCU kernel time with a named op
-    // (otherwise the CCU segment shows up as an anonymous block).
-    // SDK surface: hcomm/ccu/ccu_kernel.h  CcuKernel::AddCcuProfiling.
-    // Data type and reduce op are RESERVED because AllGather performs no
-    // reduction and each desc carries its own element width; opName is
-    // what appears on the Insight CCU lane.
-    AddCcuProfiling(channels_.data(),
-                    static_cast<uint32_t>(channels_.size()),
-                    HcclDataType::HCCL_DATA_TYPE_RESERVED,
-                    HcclDataType::HCCL_DATA_TYPE_RESERVED,
-                    HcclReduceOp::HCCL_REDUCE_RESERVED,
-                    "custom_comm::allgather_batch");
+    // TODO: AddCcuProfiling(...) disabled -- same bug as ccu_sched. Keep
+    // disabled until the SDK call pattern is verified on Atlas.
 
     return HCCL_SUCCESS;
 }

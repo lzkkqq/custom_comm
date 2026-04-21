@@ -283,19 +283,11 @@ HcclResult CcuKernelAllGatherBatchMesh1D::Algorithm() {
         NotifyWait(channels_[p], CKE_IDX, 1u << POST_SYNC_XN_ID);
     }
 
-    // Register this kernel with the CCU profiling subsystem so that
-    // MindStudio Insight associates the CCU kernel time with a named op
-    // (otherwise the CCU segment shows up as an anonymous block).
-    // SDK surface: hcomm/ccu/ccu_kernel.h  CcuKernel::AddCcuProfiling.
-    // Data type and reduce op are RESERVED because AllGather performs no
-    // reduction and each desc carries its own element width; opName is
-    // what appears on the Insight CCU lane.
-    AddCcuProfiling(channels_.data(),
-                    static_cast<uint32_t>(channels_.size()),
-                    HcclDataType::HCCL_DATA_TYPE_RESERVED,
-                    HcclDataType::HCCL_DATA_TYPE_RESERVED,
-                    HcclReduceOp::HCCL_REDUCE_RESERVED,
-                    "custom_comm::allgather_batch");
+    // TODO: AddCcuProfiling(...) temporarily disabled -- calling it with
+    // RESERVED dtype/reduce values crashes the process during Algorithm()
+    // execution at kernel register time. Reinstate once we know which
+    // HcclDataType / HcclReduceOp the SDK accepts for an AllGather that
+    // carries heterogeneous per-desc element widths and no reduction.
 
     return HCCL_SUCCESS;
 }
