@@ -46,22 +46,25 @@ static constexpr uint32_t CKE_IDX           = 0;
 static constexpr uint32_t PRE_SYNC_MASK = (1u << (MAX_DESC_COUNT + 1)) - 1;  // 0x1FF
 
 // ============================================================
-// GeneArgs slot layout
+// GeneArgs slot layout (Phase 2b-beta: LoopBlock + LoopGroupCall)
 // ============================================================
 //
 //  [0]                    token (RDMA access credential)
 //  For d in [0, MAX_DESC_COUNT):
-//    [1 + 4*d + 0]        sendAddr[d]
-//    [1 + 4*d + 1]        recvAddr[d]     (local rank's recvBuf base)
-//    [1 + 4*d + 2]        sendBytes[d]    (0 => unused desc, CCU_IF skips)
-//    [1 + 4*d + 3]        selfOffset[d]   (rankId * sendBytes[d])
+//    [1 + 6*d + 0]        sendAddr[d]
+//    [1 + 6*d + 1]        recvAddr[d]     (local rank's recvBuf base)
+//    [1 + 6*d + 2]        sendBytes[d]     (0 -> CCU_IF guard skips desc)
+//    [1 + 6*d + 3]        selfOffset[d]    (rankId * sendBytes[d])
+//    [1 + 6*d + 4]        sliceBytes[d]    (per-iter tile, <= CCU_MS_SIZE)
+//    [1 + 6*d + 5]        loopIterNum[d]   (ceil(sendBytes / sliceBytes))
 //
-// Total: 1 + 4 * MAX_DESC_COUNT = 33 slots (ceil(33/13) = 3 SQEs)
+// Total: 1 + 6 * MAX_DESC_COUNT slots. With MAX_DESC_COUNT = 6 this is 37
+// slots, well inside the 4-SQE budget (~52 slots of XN payload).
 
-static constexpr uint32_t GENE_ARGS_PER_DESC  = 4;
+static constexpr uint32_t GENE_ARGS_PER_DESC  = 6;
 static constexpr uint32_t GENE_ARGS_DESC_BASE = 1;
 static constexpr uint32_t GENE_ARGS_TOTAL     =
-    GENE_ARGS_DESC_BASE + GENE_ARGS_PER_DESC * MAX_DESC_COUNT;  // 33
+    GENE_ARGS_DESC_BASE + GENE_ARGS_PER_DESC * MAX_DESC_COUNT;  // 37 (1 + 6*6)
 
 // ============================================================
 // CcuKernelArg subclass -- passed at registration time
@@ -98,7 +101,9 @@ public:
     uint64_t sendAddr[MAX_DESC_COUNT];
     uint64_t recvAddr[MAX_DESC_COUNT];
     uint64_t sendBytes[MAX_DESC_COUNT];
-    uint64_t selfOffset[MAX_DESC_COUNT];  // rankId * sendBytes[d]
+    uint64_t selfOffset[MAX_DESC_COUNT];   // rankId * sendBytes[d]
+    uint64_t sliceBytes[MAX_DESC_COUNT];   // per-tile bytes (<= CCU_MS_SIZE)
+    uint64_t loopIterNum[MAX_DESC_COUNT];  // ceil(sendBytes / sliceBytes)
 };
 
 // ============================================================
@@ -145,6 +150,8 @@ CcuKernelAllGatherBatchMesh1DMs::GeneArgs(const hcomm::CcuTaskArg &arg) {
             slots[base + 1] = ta.recvAddr[d];
             slots[base + 2] = ta.sendBytes[d];
             slots[base + 3] = ta.selfOffset[d];
+            slots[base + 4] = ta.sliceBytes[d];
+            slots[base + 5] = ta.loopIterNum[d];
         }
         // else: zero-filled => sendBytes=0 => CCU_IF guard skips this desc
     }
@@ -211,17 +218,21 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     // CcuRep IR.
     // ================================================================
 
-    // --- GeneArgs Variables (33 total, loaded from SQE in order) ---
+    // --- GeneArgs Variables (1 + 6*MAX_DESC_COUNT = 37 total) ---
     Variable token = CreateVariable();
     Variable sendAddr[MAX_DESC_COUNT];
     Variable recvAddr[MAX_DESC_COUNT];
     Variable sendBytes[MAX_DESC_COUNT];
     Variable selfOffset[MAX_DESC_COUNT];
+    Variable sliceBytes[MAX_DESC_COUNT];
+    Variable loopIterNum[MAX_DESC_COUNT];
     for (uint32_t d = 0; d < MAX_DESC_COUNT; ++d) {
-        sendAddr[d]   = CreateVariable();
-        recvAddr[d]   = CreateVariable();
-        sendBytes[d]  = CreateVariable();
-        selfOffset[d] = CreateVariable();
+        sendAddr[d]    = CreateVariable();
+        recvAddr[d]    = CreateVariable();
+        sendBytes[d]   = CreateVariable();
+        selfOffset[d]  = CreateVariable();
+        sliceBytes[d]  = CreateVariable();
+        loopIterNum[d] = CreateVariable();
     }
 
     // --- Channel-linked Variables: receive peer's token + recvAddrs ---
@@ -257,19 +268,14 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     // Single CompletedEvent tracks all WriteNb/LocalCopyNb completions
     CompletedEvent event = CreateCompletedEvent();
 
-    // Phase 2b-α: Allocate on-chip CcuBuf staging area per descriptor.
-    // Each CcuBuf is a CCU_MS_SIZE-wide on-chip slot (see hcomm/ccu/
-    // ccu_microcode_v1.h: CCU_MS_SIZE = 4096).  Routing data through
-    // a CcuBuf is what makes the CCU translator emit TransLocMemToLocMS /
-    // TransLocMSToRmtMem instructions -- the actual "MS" code path.
-    //
-    // Limitation: each slot currently only holds CCU_MS_SIZE bytes, so
-    // callers sending more than 4 KiB per desc will hit an overflow
-    // until Phase 2b-γ wires in CreateBlockCcuBuf(N) + LoopGroupCall to
-    // tile the slots.  The test harness uses 256 B / 16 B descs so this
-    // is OK for the smoke probe.
-    std::vector<CcuBuf> stagingBuf(MAX_DESC_COUNT);
-    CreateBlockCcuBuf(MAX_DESC_COUNT, stagingBuf.data());
+    // Single-slot staging area (1 CcuBuf + 1 Executor).  The broadcast
+    // LoopBlock below reuses this slot for every desc / every iteration;
+    // LoopGroupCall drives loopIterNum[d] tiles per desc so payload size
+    // is no longer capped at CCU_MS_SIZE.
+    std::vector<CcuBuf> stagingBuf(1);
+    CreateBlockCcuBuf(1, stagingBuf.data());
+    std::vector<CcuRep::Executor> executors(1);
+    CreateBlockExecutor(1, executors.data());
 
     // ================================================================
     // LoadArgs: bind each Variable to the next GeneArgs slot.
@@ -282,6 +288,8 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
         Load(recvAddr[d]);
         Load(sendBytes[d]);
         Load(selfOffset[d]);
+        Load(sliceBytes[d]);
+        Load(loopIterNum[d]);
     }
 
     // ================================================================
@@ -303,46 +311,98 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     }
 
     // ================================================================
-    // DoAllGather (Phase 2b-alpha):
-    //   local HBM --LocalCopyNb-->  CcuBuf (LocMS staging) --> peers
-    //                                      +---LocalCopyNb--> self recvBuf
+    // DoAllGather (Phase 2b-beta): Declare one LoopBlock whose body
+    // stages a tile from HBM to CcuBuf, fans it out over WriteNb to
+    // every peer, writes a self copy, and waits the batch.  Each desc
+    // then triggers a LoopGroupCall that drives `loopIterNum[d]`
+    // invocations of the block, with offsets advancing by `sliceBytes`.
     //
-    // Routing through CcuBuf causes the CCU microcode lowering to emit
-    // TransLocMemToLocMS + TransLocMsToRmtMem + TransLocMsToLocMem
-    // instructions, which is the real "MS" data path that logs will show.
-    // Still 1-slot, no LoopGroupCall — no parallel fan-out yet.
+    //   HBM --LocalCopyNb--> CcuBuf
+    //        --WriteNb-----> peer recvBuf[]   (fan-out)
+    //        --LocalCopyNb-> self recvBuf     (rank-local slot)
+    //        --WaitEvent---> drain the tile
     // ================================================================
 
+    // --- LoopBlock formal parameters ---
+    LocalAddr srcArg  = CreateLocalAddr();
+    LocalAddr selfArg = CreateLocalAddr();
+    std::vector<RemoteAddr> peerArg(numPeers);
+    for (uint32_t p = 0; p < numPeers; ++p) {
+        peerArg[p] = CreateRemoteAddr();
+    }
+    Variable sliceArg = CreateVariable();
+
+    {
+        CcuRep::LoopBlock block(this, "ag_batch_bcast");
+        block(srcArg, peerArg, selfArg, sliceArg);
+
+        // Stage: local src -> on-chip MS buffer.
+        LocalCopyNb(stagingBuf[0], srcArg, sliceArg, /*event=*/event);
+        event.mask = 1u;
+        WaitEvent(event);
+
+        // Fan-out: push the tile to every peer.
+        for (uint32_t p = 0; p < numPeers; ++p) {
+            event.mask = 1u << p;
+            WriteNb(channels_[p], peerArg[p], stagingBuf[0], sliceArg, event);
+        }
+
+        // Self-copy: same tile to rankId's own slot in recvBuf.
+        event.mask = 1u << numPeers;
+        LocalCopyNb(selfArg, stagingBuf[0], sliceArg, event);
+
+        // Drain all N+1 outstanding ops before the next iteration.
+        event.mask = (1u << (numPeers + 1)) - 1u;
+        WaitEvent(event);
+    }
+
+    // ================================================================
+    // Per-desc invocation: bind runtime addresses and fire LoopGroupCall.
+    // ================================================================
     for (uint32_t d = 0; d < MAX_DESC_COUNT; ++d) {
-        CCU_IF(sendBytes[d] != 0) {
-            // Source: our sendBuf
+        CCU_IF(loopIterNum[d] != 0) {
+            // Source: sendBuf[d]
             localSrc[d].addr  = sendAddr[d];
             localSrc[d].token = token;
 
-            // Stage HBM -> on-chip LocMS buffer for this desc.
-            LocalCopyNb(stagingBuf[d], localSrc[d], sendBytes[d], event);
-            WaitEvent(event);
-
-            // Fan-out LocMS -> each peer's recvBuf[d] at selfOffset
-            for (uint32_t p = 0; p < numPeers; ++p) {
-                RemoteAddr &dst = remoteDst[p * MAX_DESC_COUNT + d];
-                dst.addr  = peerRecvAddr[p * MAX_DESC_COUNT + d];
-                dst.addr += selfOffset[d];
-                dst.token = peerToken[p];
-                WriteNb(channels_[p], dst, stagingBuf[d], sendBytes[d], event);
-            }
-
-            // Self-copy LocMS -> own recvBuf[rankId]
+            // Self dest: own recvBuf[d] + rankOffset
             selfDst[d].addr  = recvAddr[d];
             selfDst[d].addr += selfOffset[d];
             selfDst[d].token = token;
-            LocalCopyNb(selfDst[d], stagingBuf[d], sendBytes[d], event);
+
+            // Peer dests: peerRecvAddr[p][d] + rankOffset
+            std::vector<RemoteAddr> peerDsts(numPeers);
+            for (uint32_t p = 0; p < numPeers; ++p) {
+                peerDsts[p] = remoteDst[p * MAX_DESC_COUNT + d];
+                peerDsts[p].addr  = peerRecvAddr[p * MAX_DESC_COUNT + d];
+                peerDsts[p].addr += selfOffset[d];
+                peerDsts[p].token = peerToken[p];
+            }
+
+            // Build the LoopCall that binds actuals to the block.
+            auto loopCall = Loop("ag_batch_bcast")(
+                localSrc[d], peerDsts, selfDst[d], sliceBytes[d]);
+
+            // loopCfg encodes (ctxId, stride, iterNum).  We store the
+            // iter count in the Variable; stride and ctxId are zeroed
+            // because this is a single-slot ring.
+            Variable loopCfg = CreateVariable();
+            loopCfg = GetLoopParam(0, kCcuMsSize, 0);
+            loopCfg = loopCfg + loopIterNum[d];
+
+            Variable paraCfg = CreateVariable();
+            paraCfg = GetParallelParam(0, 0, 1);
+
+            Variable offCfg = CreateVariable();
+            offCfg = GetOffsetParam(kCcuMsSize, kCcuMsInterleave, 0);
+
+            CcuRep::LoopGroupCall lgc(this, "agbatch_bcast_grp");
+            lgc.Run({loopCall}, {loopCfg}, {executors[0]}, paraCfg, offCfg);
         }
     }
 
     // ================================================================
-    // PostSync: wait for all data movements, then barrier across ranks
-    // to ensure all remote writes are globally visible before return.
+    // PostSync: wait for all transfers, notify peers, drain the barrier.
     // ================================================================
 
     WaitEvent(event);
@@ -405,10 +465,25 @@ HcclResult LaunchBatchedAGKernelMs(
             return HCCL_E_PARA;
         }
         uint64_t bytes       = taskArg.descs[d].sendCount * elemSize;
-        ccuArg.sendAddr[d]   = reinterpret_cast<uint64_t>(taskArg.descs[d].sendBuf);
-        ccuArg.recvAddr[d]   = reinterpret_cast<uint64_t>(taskArg.descs[d].recvBuf);
-        ccuArg.sendBytes[d]  = bytes;
-        ccuArg.selfOffset[d] = static_cast<uint64_t>(taskArg.rankId) * bytes;
+        ccuArg.sendAddr[d]    = reinterpret_cast<uint64_t>(taskArg.descs[d].sendBuf);
+        ccuArg.recvAddr[d]    = reinterpret_cast<uint64_t>(taskArg.descs[d].recvBuf);
+        ccuArg.sendBytes[d]   = bytes;
+        ccuArg.selfOffset[d]  = static_cast<uint64_t>(taskArg.rankId) * bytes;
+        // Phase 2b-β: slice each desc into ceil(bytes / CCU_MS_SIZE) tiles.
+        //   sliceBytes is the common tile size (CCU_MS_SIZE for multi-tile,
+        //   the full payload when bytes < CCU_MS_SIZE), loopIterNum how
+        //   many tiles the LoopBlock iterates.
+        constexpr uint64_t kTile = kCcuMsSize;
+        if (bytes == 0) {
+            ccuArg.sliceBytes[d]  = 0;
+            ccuArg.loopIterNum[d] = 0;
+        } else if (bytes <= kTile) {
+            ccuArg.sliceBytes[d]  = bytes;
+            ccuArg.loopIterNum[d] = 1;
+        } else {
+            ccuArg.sliceBytes[d]  = kTile;
+            ccuArg.loopIterNum[d] = (bytes + kTile - 1) / kTile;
+        }
 
         if (diag) {
             GoSize gs = CalGoSize(bytes);
