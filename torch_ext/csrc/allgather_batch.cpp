@@ -30,6 +30,11 @@ HcclResult HcomGetCommHandleByGroup(const char *group, HcclComm *commHandle);
 #ifndef CUSTOM_COMM_NO_NPU
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include <acl/acl_rt.h>
+
+// Forward declaration for the RT-layer symbol that binds an extra stream
+// into the active aclGraph capture. Exported by libruntime.so but not
+// surfaced in any public header we currently depend on.
+extern "C" int rtStreamAddToModel(void *stream, void *model);
 #endif
 
 // ============================================================
@@ -161,8 +166,13 @@ struct CommStreamCtx {
     void init() {
         if (stream) return;
         ACL_TORCH_CHECK(aclrtCreateStream(&stream));
-        ACL_TORCH_CHECK(aclrtCreateEvent(&pre));
-        ACL_TORCH_CHECK(aclrtCreateEvent(&post));
+        // ACL_EVENT_CAPTURE_STREAM_PROGRESS makes the event usable across
+        // both eager execution and aclGraph capture. A default-flag event
+        // (aclrtCreateEvent) cannot be recorded on a capture stream and
+        // triggers ACL error 207000 the moment we enter torch.npu.graph().
+        // torch_npu/ProcessGroupHCCL uses the same flag for its NPUEvents.
+        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&pre,  ACL_EVENT_CAPTURE_STREAM_PROGRESS));
+        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&post, ACL_EVENT_CAPTURE_STREAM_PROGRESS));
     }
 };
 
@@ -172,18 +182,29 @@ static void DispatchHcclOnCommStream(
     HcclComm comm,
     aclrtStream computeStream) {
 
-    // Cached per-thread: avoid aclrtCreate on every call.
+    // Cached per-thread HCCL stream + sync events; cheaper than re-creating.
     static thread_local CommStreamCtx ctx;
     ctx.init();
 
-    // compute → comm: wait for pending work on compute stream
+    // Under aclGraph capture, ctx.stream must be registered with the active
+    // rtModel so that HCCL work on it is part of the captured graph. Without
+    // this, the replay runs an empty graph and the collective is silently
+    // dropped. rtStreamAddToModel is idempotent per (stream, model).
+    aclmdlRICaptureStatus captureStatus = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI rtModel = nullptr;
+    aclError captureQuery = aclmdlRICaptureGetInfo(computeStream, &captureStatus, &rtModel);
+    if (captureQuery == ACL_SUCCESS
+        && captureStatus == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE
+        && rtModel != nullptr) {
+        int addRet = rtStreamAddToModel(ctx.stream, rtModel);
+        TORCH_CHECK(addRet == 0,
+                    "rtStreamAddToModel failed with code ", addRet,
+                    " while registering comm stream into active aclGraph capture");
+    }
+
     ACL_TORCH_CHECK(aclrtRecordEvent(ctx.pre, computeStream));
     ACL_TORCH_CHECK(aclrtStreamWaitEvent(ctx.stream, ctx.pre));
-
-    // HCCL on dedicated comm stream
     HCCL_TORCH_CHECK(HcclAllGatherBatch(descs, descCount, comm, ctx.stream));
-
-    // comm → compute: wait for HCCL to finish before compute resumes
     ACL_TORCH_CHECK(aclrtRecordEvent(ctx.post, ctx.stream));
     ACL_TORCH_CHECK(aclrtStreamWaitEvent(computeStream, ctx.post));
 }
