@@ -38,6 +38,24 @@ HcclResult LaunchBatchedAGKernelMs(
     CcuKernelHandle kernel,
     const AllGatherBatchTaskArg& taskArg);
 
+// ---- V2: GroupBroadcastBatch-based kernel (CUSTOM_COMM_CCU_MS_IMPL=v2) ----
+//
+// Same external contract as the v1 functions above; the only differences are
+// the kernel signature ("AgBatchMesh1DMsV2_" + rankSize) and the internal DSL
+// (one GroupBroadcastBatch call vs the hand-rolled LoopBlock+LoopGroupCall).
+HcclResult RegisterBatchedAGKernelMsV2(
+    HcclComm comm,
+    CcuKernelHandle* handle,
+    uint32_t rankId,
+    uint32_t rankSize,
+    const std::vector<ChannelHandle>& channels);
+
+HcclResult LaunchBatchedAGKernelMsV2(
+    HcclComm comm,
+    ThreadHandle threadHandle,
+    CcuKernelHandle kernel,
+    const AllGatherBatchTaskArg& taskArg);
+
 }  // namespace ccu_ms
 }  // namespace custom_comm
 
