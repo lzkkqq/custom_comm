@@ -386,26 +386,25 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
                 peerDsts[p].token = peerToken[p];
             }
 
-            // Build the LoopCall that binds actuals to the block.
+            // Route B (Phase 2b-β, minimal residual variant):
+            // For bytes <= memSlice * loopCount (= 256KB), CalGoSize's
+            // "main-loop" branch (goAddrOffset != 0) never fires, so we
+            // need only the HCCL `GroupBroadcast` residual branch:
+            //   sliceArg  = full sendBytes (one contiguous transfer)
+            //   loopCfg   = GetLoopParam(0, 0, 1)   [iter=1, no stride]
+            //   paraCfg   = GetParallelParam(0, 0, 1)
+            // The Full Phase 2b-γ work (>256KB payloads requiring the
+            // goAddrOffset chunk iteration) is tracked separately.
             auto loopCall = Loop("ag_batch_bcast")(
-                localSrc[d], peerDsts, selfDst[d], sliceBytes[d]);
+                localSrc[d], peerDsts, selfDst[d], sendBytes[d]);
 
-            // loopCfg encodes (ctxId, stride, iterNum).  We store the
-            // iter count in the Variable; stride and ctxId are zeroed
-            // because this is a single-slot ring.
             Variable loopCfg = CreateVariable();
-            loopCfg = GetLoopParam(0, kCcuMsSize, 0);
-            loopCfg = loopCfg + loopIterNum[d];
+            loopCfg = GetLoopParam(0, 0, 1);
 
             Variable paraCfg = CreateVariable();
             paraCfg = GetParallelParam(0, 0, 1);
 
             Variable offCfg = CreateVariable();
-            // ckeOffset=1 matches every HCCL reference call site (e.g.
-            // ccu_kernel_alg_base.cc:181,218); ckeOffset=0 leaves the
-            // per-iteration CKE advance unset, which for LoopGroupCall
-            // is wrong even at loopIterNum=1 because the hardware still
-            // schedules a prefetch lane.
             offCfg = GetOffsetParam(kCcuMsSize, kCcuMsInterleave, 1);
 
             CcuRep::LoopGroupCall lgc(this, "agbatch_bcast_grp");
