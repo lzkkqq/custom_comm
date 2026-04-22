@@ -196,6 +196,8 @@ class TestCcuPath:
         4096,
         4097,
         8192,
+        32768,    # v2: LoopGroup[0] entry threshold (memSlice * kV2ParallelDim)
+        49152,    # v2: LoopGroup[0] + LoopGroup[1] together (m=1, n=4, p=0)
         65536,
     ])
     def test_ccu_ms_size_boundary(self, bytes_per_desc):
