@@ -45,26 +45,25 @@ static constexpr uint32_t CKE_IDX           = 0;
 // PreSync mask: bits 0..(MAX_DESC_COUNT), covering token + all recvAddr slots
 static constexpr uint32_t PRE_SYNC_MASK = (1u << (MAX_DESC_COUNT + 1)) - 1;  // 0x1FF
 
-// ============================================================
-// GeneArgs slot layout (Phase 2b-beta: LoopBlock + LoopGroupCall)
-// ============================================================
+// GeneArgs layout (Phase 2b-gamma: full HCCL GroupBroadcast pattern).
 //
 //  [0]                    token (RDMA access credential)
 //  For d in [0, MAX_DESC_COUNT):
-//    [1 + 6*d + 0]        sendAddr[d]
-//    [1 + 6*d + 1]        recvAddr[d]     (local rank's recvBuf base)
-//    [1 + 6*d + 2]        sendBytes[d]     (0 -> CCU_IF guard skips desc)
-//    [1 + 6*d + 3]        selfOffset[d]    (rankId * sendBytes[d])
-//    [1 + 6*d + 4]        sliceBytes[d]    (per-iter tile, <= CCU_MS_SIZE)
-//    [1 + 6*d + 5]        loopIterNum[d]   (ceil(sendBytes / sliceBytes))
+//    [1 + 8*d + 0]        sendAddr[d]
+//    [1 + 8*d + 1]        recvAddr[d]        (rank-local recvBuf base)
+//    [1 + 8*d + 2]        sendBytes[d]       (0 -> CCU_IF guard skips desc)
+//    [1 + 8*d + 3]        selfOffset[d]      (rankId * sendBytes[d])
+//    [1 + 8*d + 4]        goAddrOffset[d]   (main-loop skip in bytes)
+//    [1 + 8*d + 5]        goLoopParam[d]    (packed main-loop loopCfg)
+//    [1 + 8*d + 6]        goParallelParam[d](packed residual paraCfg)
+//    [1 + 8*d + 7]        goResidual[d]     (residual lc0 sliceSize)
 //
-// Total: 1 + 6 * MAX_DESC_COUNT slots. With MAX_DESC_COUNT = 6 this is 37
-// slots, well inside the 4-SQE budget (~52 slots of XN payload).
+// 1 + 8 * MAX_DESC_COUNT words total.  With MAX_DESC_COUNT = 6 this is 49.
 
-static constexpr uint32_t GENE_ARGS_PER_DESC  = 6;
+static constexpr uint32_t GENE_ARGS_PER_DESC  = 8;
 static constexpr uint32_t GENE_ARGS_DESC_BASE = 1;
 static constexpr uint32_t GENE_ARGS_TOTAL     =
-    GENE_ARGS_DESC_BASE + GENE_ARGS_PER_DESC * MAX_DESC_COUNT;  // 37 (1 + 6*6)
+    GENE_ARGS_DESC_BASE + GENE_ARGS_PER_DESC * MAX_DESC_COUNT;  // 1 + 8*MAX
 
 // ============================================================
 // CcuKernelArg subclass -- passed at registration time
@@ -102,8 +101,11 @@ public:
     uint64_t recvAddr[MAX_DESC_COUNT];
     uint64_t sendBytes[MAX_DESC_COUNT];
     uint64_t selfOffset[MAX_DESC_COUNT];   // rankId * sendBytes[d]
-    uint64_t sliceBytes[MAX_DESC_COUNT];   // per-tile bytes (<= CCU_MS_SIZE)
-    uint64_t loopIterNum[MAX_DESC_COUNT];  // ceil(sendBytes / sliceBytes)
+    // CalGoSize outputs used by the HCCL-style two-branch LoopGroupCall.
+    uint64_t goAddrOffset[MAX_DESC_COUNT];     // = m * loopSize (main-branch prefix)
+    uint64_t goLoopParam[MAX_DESC_COUNT];      // packed GetLoopParam for main branch
+    uint64_t goParallelParam[MAX_DESC_COUNT];  // packed paraCfg for residual branch
+    uint64_t goResidual[MAX_DESC_COUNT];       // residual-branch lc0 sliceSize
 };
 
 // ============================================================
@@ -150,8 +152,10 @@ CcuKernelAllGatherBatchMesh1DMs::GeneArgs(const hcomm::CcuTaskArg &arg) {
             slots[base + 1] = ta.recvAddr[d];
             slots[base + 2] = ta.sendBytes[d];
             slots[base + 3] = ta.selfOffset[d];
-            slots[base + 4] = ta.sliceBytes[d];
-            slots[base + 5] = ta.loopIterNum[d];
+            slots[base + 4] = ta.goAddrOffset[d];
+            slots[base + 5] = ta.goLoopParam[d];
+            slots[base + 6] = ta.goParallelParam[d];
+            slots[base + 7] = ta.goResidual[d];
         }
         // else: zero-filled => sendBytes=0 => CCU_IF guard skips this desc
     }
@@ -224,15 +228,19 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     Variable recvAddr[MAX_DESC_COUNT];
     Variable sendBytes[MAX_DESC_COUNT];
     Variable selfOffset[MAX_DESC_COUNT];
-    Variable sliceBytes[MAX_DESC_COUNT];
-    Variable loopIterNum[MAX_DESC_COUNT];
+    Variable goAddrOffset[MAX_DESC_COUNT];
+    Variable goLoopParam[MAX_DESC_COUNT];
+    Variable goParallelParam[MAX_DESC_COUNT];
+    Variable goResidual[MAX_DESC_COUNT];
     for (uint32_t d = 0; d < MAX_DESC_COUNT; ++d) {
-        sendAddr[d]    = CreateVariable();
-        recvAddr[d]    = CreateVariable();
-        sendBytes[d]   = CreateVariable();
-        selfOffset[d]  = CreateVariable();
-        sliceBytes[d]  = CreateVariable();
-        loopIterNum[d] = CreateVariable();
+        sendAddr[d]        = CreateVariable();
+        recvAddr[d]        = CreateVariable();
+        sendBytes[d]       = CreateVariable();
+        selfOffset[d]      = CreateVariable();
+        goAddrOffset[d]    = CreateVariable();
+        goLoopParam[d]     = CreateVariable();
+        goParallelParam[d] = CreateVariable();
+        goResidual[d]      = CreateVariable();
     }
 
     // --- Channel-linked Variables: receive peer's token + recvAddrs ---
@@ -274,10 +282,13 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     // lanes (self-copy in particular) writing into uninitialized storage.
     // Matches HCCL's `CreateBlockCcuBuf(loopCount * msInterleave)` pattern
     // (see ccu_kernel_alg_base.cc CreateMultiOp{Broadcast,Reduce}*).
-    std::vector<CcuBuf> stagingBuf(kCcuMsInterleave);
-    CreateBlockCcuBuf(kCcuMsInterleave, stagingBuf.data());
-    std::vector<CcuRep::Executor> executors(1);
-    CreateBlockExecutor(1, executors.data());
+    // Two LoopBlocks share the staging ring: each gets kCcuMsInterleave
+    // slots, matching HCCL's CreateMultiOp{Broadcast,Reduce} layout.
+    constexpr uint32_t kNumBlocks = 2;
+    std::vector<CcuBuf> stagingBuf(kNumBlocks * kCcuMsInterleave);
+    CreateBlockCcuBuf(stagingBuf.size(), stagingBuf.data());
+    std::vector<CcuRep::Executor> executors(kNumBlocks);
+    CreateBlockExecutor(kNumBlocks, executors.data());
 
     // ================================================================
     // LoadArgs: bind each Variable to the next GeneArgs slot.
@@ -290,8 +301,10 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
         Load(recvAddr[d]);
         Load(sendBytes[d]);
         Load(selfOffset[d]);
-        Load(sliceBytes[d]);
-        Load(loopIterNum[d]);
+        Load(goAddrOffset[d]);
+        Load(goLoopParam[d]);
+        Load(goParallelParam[d]);
+        Load(goResidual[d]);
     }
 
     // ================================================================
@@ -325,35 +338,46 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     //        --WaitEvent---> drain the tile
     // ================================================================
 
-    // --- LoopBlock formal parameters ---
-    LocalAddr srcArg  = CreateLocalAddr();
-    LocalAddr selfArg = CreateLocalAddr();
-    std::vector<RemoteAddr> peerArg(numPeers);
-    for (uint32_t p = 0; p < numPeers; ++p) {
-        peerArg[p] = CreateRemoteAddr();
+    // --- Two LoopBlocks (ag_batch_bcast_0 / ag_batch_bcast_1) ---
+    // HCCL-style: both blocks share the {src, peerDsts, self, sliceArg}
+    // signature; the only structural difference is which CcuBuf-staging
+    // slot lane the runtime uses.  Per-descriptor dispatch later chooses
+    // which block(s) to instantiate via the LoopGroupCall paraCfg.
+    std::array<LocalAddr, 2> srcArg;
+    std::array<LocalAddr, 2> selfArg;
+    std::array<Variable, 2>  sliceArg;
+    std::array<std::vector<RemoteAddr>, 2> peerArg;
+    for (uint32_t bi = 0; bi < 2; ++bi) {
+        srcArg[bi]   = CreateLocalAddr();
+        selfArg[bi]  = CreateLocalAddr();
+        sliceArg[bi] = CreateVariable();
+        peerArg[bi].resize(numPeers);
+        for (uint32_t p = 0; p < numPeers; ++p) {
+            peerArg[bi][p] = CreateRemoteAddr();
+        }
     }
-    Variable sliceArg = CreateVariable();
 
-    {
-        CcuRep::LoopBlock block(this, "ag_batch_bcast");
-        block(srcArg, peerArg, selfArg, sliceArg);
+    static constexpr std::array<const char*, 2> kBlockNames = {
+        "ag_batch_bcast_0", "ag_batch_bcast_1"
+    };
+    for (uint32_t bi = 0; bi < 2; ++bi) {
+        CcuRep::LoopBlock block(this, kBlockNames[bi]);
+        block(srcArg[bi], peerArg[bi], selfArg[bi], sliceArg[bi]);
 
-        // Stage: local src -> on-chip MS buffer.
-        LocalCopyNb(stagingBuf[0], srcArg, sliceArg, /*event=*/event);
+        CcuBuf &stageSlot = stagingBuf[bi * kCcuMsInterleave];
+
+        LocalCopyNb(stageSlot, srcArg[bi], sliceArg[bi], event);
         event.mask = 1u;
         WaitEvent(event);
 
-        // Fan-out: push the tile to every peer.
         for (uint32_t p = 0; p < numPeers; ++p) {
             event.mask = 1u << p;
-            WriteNb(channels_[p], peerArg[p], stagingBuf[0], sliceArg, event);
+            WriteNb(channels_[p], peerArg[bi][p], stageSlot, sliceArg[bi], event);
         }
 
-        // Self-copy: same tile to rankId's own slot in recvBuf.
         event.mask = 1u << numPeers;
-        LocalCopyNb(selfArg, stagingBuf[0], sliceArg, event);
+        LocalCopyNb(selfArg[bi], stagingBuf[bi * kCcuMsInterleave], sliceArg[bi], event);
 
-        // Drain all N+1 outstanding ops before the next iteration.
         event.mask = (1u << (numPeers + 1)) - 1u;
         WaitEvent(event);
     }
@@ -362,7 +386,7 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     // Per-desc invocation: bind runtime addresses and fire LoopGroupCall.
     // ================================================================
     for (uint32_t d = 0; d < MAX_DESC_COUNT; ++d) {
-        CCU_IF(loopIterNum[d] != 0) {
+        CCU_IF(sendBytes[d] != 0) {
             // Source: sendBuf[d]
             localSrc[d].addr  = sendAddr[d];
             localSrc[d].token = token;
@@ -386,31 +410,64 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
                 peerDsts[p].token = peerToken[p];
             }
 
-            // Route B (Phase 2b-β, minimal residual variant):
-            // For bytes <= memSlice * loopCount (= 256KB), CalGoSize's
-            // "main-loop" branch (goAddrOffset != 0) never fires, so we
-            // need only the HCCL `GroupBroadcast` residual branch:
-            //   sliceArg  = full sendBytes (one contiguous transfer)
-            //   loopCfg   = GetLoopParam(0, 0, 1)   [iter=1, no stride]
-            //   paraCfg   = GetParallelParam(0, 0, 1)
-            // The Full Phase 2b-γ work (>256KB payloads requiring the
-            // goAddrOffset chunk iteration) is tracked separately.
-            auto loopCall = Loop("ag_batch_bcast")(
-                localSrc[d], peerDsts, selfDst[d], sendBytes[d]);
-
-            Variable loopCfg = CreateVariable();
-            loopCfg = GetLoopParam(0, 0, 1);
-
-            Variable paraCfg = CreateVariable();
-            paraCfg = GetParallelParam(0, 0, 1);
+            // Memory-slice constant used by both LoopGroupCall branches.
+            Variable memSliceVar = CreateVariable();
+            memSliceVar = static_cast<uint64_t>(kCcuMsSize);
 
             Variable offCfg = CreateVariable();
             offCfg = GetOffsetParam(kCcuMsSize, kCcuMsInterleave, 1);
 
-            CcuRep::LoopGroupCall lgc(this, "agbatch_bcast_grp");
-            lgc.Run({loopCall}, {loopCfg}, {executors[0]}, paraCfg, offCfg);
-        }
-    }
+            // ---- Branch 1: main-loop (m * loopSize bytes) ----
+            CCU_IF(goAddrOffset[d] != 0) {
+                auto lcMain = Loop("ag_batch_bcast_0")(
+                    localSrc[d], peerDsts, selfDst[d], memSliceVar);
+
+                Variable loopCfgMain = CreateVariable();
+                loopCfgMain = GetLoopParam(0, kCcuMsSize * kCcuMsDefaultLoopCount, 0);
+                loopCfgMain += goLoopParam[d];
+
+                Variable paraCfgMain = CreateVariable();
+                paraCfgMain = GetParallelParam(kCcuMsDefaultLoopCount - 1, 0, 1);
+
+                CcuRep::LoopGroupCall lgc(this, "ag_batch_bcast_main");
+                lgc.Run({lcMain}, {loopCfgMain}, {executors[0]}, paraCfgMain, offCfg);
+            }
+
+            // ---- Branch 2: residual tail (n * memSlice + p bytes). ----
+            CCU_IF(goParallelParam[d] != 0) {
+                // Shift past the main-loop-consumed prefix.
+                localSrc[d].addr += goAddrOffset[d];
+                selfDst[d].addr  += goAddrOffset[d];
+                for (uint32_t p = 0; p < numPeers; ++p) {
+                    peerDsts[p].addr += goAddrOffset[d];
+                }
+
+                // lc0 handles the `p` bytes (residual < memSlice).
+                auto lc0 = Loop("ag_batch_bcast_0")(
+                    localSrc[d], peerDsts, selfDst[d], goResidual[d]);
+
+                // Shift past residual to reach the `n * memSlice` chunks.
+                localSrc[d].addr += goResidual[d];
+                selfDst[d].addr  += goResidual[d];
+                for (uint32_t p = 0; p < numPeers; ++p) {
+                    peerDsts[p].addr += goResidual[d];
+                }
+
+                auto lc1 = Loop("ag_batch_bcast_1")(
+                    localSrc[d], peerDsts, selfDst[d], memSliceVar);
+
+                Variable loopCfg0 = CreateVariable();
+                loopCfg0 = GetLoopParam(0, 0, 1);
+                Variable loopCfg1 = CreateVariable();
+                loopCfg1 = GetLoopParam(0, 0, 1);
+
+                CcuRep::LoopGroupCall lgc(this, "agbatch_bcast_tail");
+                lgc.Run({lc0, lc1}, {loopCfg0, loopCfg1},
+                        {executors[0], executors[1]},
+                        goParallelParam[d], offCfg);
+            }
+        }  // CCU_IF(sendBytes[d] != 0)
+    }  // for d
 
     // ================================================================
     // PostSync: wait for all transfers, notify peers, drain the barrier.
@@ -480,21 +537,12 @@ HcclResult LaunchBatchedAGKernelMs(
         ccuArg.recvAddr[d]    = reinterpret_cast<uint64_t>(taskArg.descs[d].recvBuf);
         ccuArg.sendBytes[d]   = bytes;
         ccuArg.selfOffset[d]  = static_cast<uint64_t>(taskArg.rankId) * bytes;
-        // Phase 2b-β: slice each desc into ceil(bytes / CCU_MS_SIZE) tiles.
-        //   sliceBytes is the common tile size (CCU_MS_SIZE for multi-tile,
-        //   the full payload when bytes < CCU_MS_SIZE), loopIterNum how
-        //   many tiles the LoopBlock iterates.
-        constexpr uint64_t kTile = kCcuMsSize;
-        if (bytes == 0) {
-            ccuArg.sliceBytes[d]  = 0;
-            ccuArg.loopIterNum[d] = 0;
-        } else if (bytes <= kTile) {
-            ccuArg.sliceBytes[d]  = bytes;
-            ccuArg.loopIterNum[d] = 1;
-        } else {
-            ccuArg.sliceBytes[d]  = kTile;
-            ccuArg.loopIterNum[d] = (bytes + kTile - 1) / kTile;
-        }
+        // Phase 2b-γ: feed the HCCL-style two-branch LoopGroupCall via CalGoSize.
+        GoSize go = CalGoSize(bytes);
+        ccuArg.goAddrOffset[d]    = go.addrOffset;
+        ccuArg.goLoopParam[d]     = go.loopParam;
+        ccuArg.goParallelParam[d] = go.parallelParam;
+        ccuArg.goResidual[d]      = go.residual;
 
         if (diag) {
             GoSize gs = CalGoSize(bytes);
