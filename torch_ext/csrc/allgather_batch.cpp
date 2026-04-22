@@ -166,13 +166,14 @@ struct CommStreamCtx {
     void init() {
         if (stream) return;
         ACL_TORCH_CHECK(aclrtCreateStream(&stream));
-        // ACL_EVENT_CAPTURE_STREAM_PROGRESS makes the event usable across
-        // both eager execution and aclGraph capture. A default-flag event
-        // (aclrtCreateEvent) cannot be recorded on a capture stream and
-        // triggers ACL error 207000 the moment we enter torch.npu.graph().
-        // torch_npu/ProcessGroupHCCL uses the same flag for its NPUEvents.
-        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&pre,  ACL_EVENT_CAPTURE_STREAM_PROGRESS));
-        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&post, ACL_EVENT_CAPTURE_STREAM_PROGRESS));
+        // ACL_EVENT_SYNC matches what torch_npu's NPUEvent defaults to (see
+        // NPUEvent.cpp) and what HCCL uses for cross-stream sync. It is
+        // record-and-wait-capable inside aclGraph capture, unlike the
+        // default-flag aclrtCreateEvent (which fails with 207000) or
+        // ACL_EVENT_CAPTURE_STREAM_PROGRESS (which is record-only and
+        // rejects aclrtStreamWaitEvent).
+        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&pre,  ACL_EVENT_SYNC));
+        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&post, ACL_EVENT_SYNC));
     }
 };
 
