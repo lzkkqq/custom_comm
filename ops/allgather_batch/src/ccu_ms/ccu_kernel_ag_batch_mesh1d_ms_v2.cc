@@ -170,7 +170,12 @@ HcclResult CcuKernelAllGatherBatchMesh1DMsV2::Algorithm() {
 
     const uint32_t numPeers = rankSize_ - 1;
 
-    AllocGoResource();    // idempotent; also invoked again inside GroupBroadcastBatch
+    // AllocGoResource(parallelDim=8) -- deliberately low-parallelism. The hccl
+    // default parallelDim=64 allocates 64 executors/events and 512 CcuBufs,
+    // blowing past the per-die MS budget (observed: blockMsReq=384 > die cap).
+    // batch workloads here run many small descs, not one big one, so 8-way
+    // parallelism is plenty and keeps resource usage on par with v1.
+    AllocGoResource(/*parallelDim=*/8, /*msPerLoop=*/1);
 
     // ---- Per-desc Variables mirroring the GeneArgs slot layout ----
     Variable token = CreateVariable();
