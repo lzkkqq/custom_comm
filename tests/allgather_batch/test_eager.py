@@ -189,6 +189,7 @@ class TestCcuPath:
         assert torch.equal(out_data, expected_data)
         assert torch.equal(out_scale, expected_scale)
 
+    @pytest.mark.parametrize("impl", ["v1", "v2"])
     @pytest.mark.parametrize("bytes_per_desc", [
         1024,     # 1 KB -- well under single-slot limit
         2048,     # 2 KB
@@ -197,24 +198,23 @@ class TestCcuPath:
         8192,     # 8 KB -- 2x single slot; should fail on Phase 2b-alpha
         65536,    # 64 KB -- many slots; definitely needs Phase 2b-gamma
     ])
-    def test_ccu_ms_size_boundary(self, bytes_per_desc):
+    def test_ccu_ms_size_boundary(self, bytes_per_desc, impl):
         """Probe CalGoSize boundaries: small -> 4 KB -> multi-slot.
 
-        For each payload size, run MS path and diff against SCHED path.
-        If Phase 2b-alpha's single-slot CcuBuf has a 4 KiB limit, writing
-        sizes >= 4 KiB will either drop data silently or trigger a kernel
-        error. The assertion below catches both.
-
-        Before running: export CUSTOM_COMM_CCU_MODE (handled per-case).
+        For each (payload size, MS impl) combination, run MS path and diff
+        against SCHED path. impl=v1 is the hand-rolled kernel; impl=v2 uses
+        GroupBroadcastBatch via CcuKernelAlgBase. Both must byte-exactly
+        match SCHED, which is the golden reference.
         """
         import os
         # Use deterministic per-rank payload
         n_elts = bytes_per_desc
         data = (torch.arange(n_elts, dtype=torch.int8) + self.rank).to(self.device)
 
-        # Run MS path
+        # Run MS path (v1 or v2 per parametrization)
         os.environ["CUSTOM_COMM_USE_CCU"] = "1"
         os.environ["CUSTOM_COMM_CCU_MODE"] = "ms"
+        os.environ["CUSTOM_COMM_CCU_MS_IMPL"] = impl
         os.environ["CUSTOM_COMM_CCU_MS_DIAG"] = "1"
         try:
             [out_ms] = torch.ops.custom_comm.allgather_batch(
@@ -224,6 +224,7 @@ class TestCcuPath:
 
         # Run SCHED path (reference truth)
         os.environ["CUSTOM_COMM_CCU_MODE"] = "sched"
+        os.environ.pop("CUSTOM_COMM_CCU_MS_IMPL", None)
         [out_sched] = torch.ops.custom_comm.allgather_batch(
             [data], self.hcom, self.world_size)
 
@@ -232,5 +233,35 @@ class TestCcuPath:
         os.environ.pop("CUSTOM_COMM_CCU_MS_DIAG", None)
 
         assert torch.equal(out_ms, out_sched), (
-            f"MS vs SCHED mismatch at bytes_per_desc={bytes_per_desc}; "
+            f"MS({impl}) vs SCHED mismatch at bytes_per_desc={bytes_per_desc}; "
             f"diff at {(out_ms != out_sched).nonzero()}")
+
+    def test_ccu_ms_v2_only(self):
+        """Smoke test: V2 kernel (GroupBroadcastBatch) produces the expected
+        all-gather of deterministic inputs. Mirrors test_ccu_only but forces
+        CCU_MODE=ms and CCU_MS_IMPL=v2 so the V2 code path is exercised
+        without relying on the v1-vs-SCHED diff from size_boundary.
+        """
+        import os
+        data = (torch.arange(256) + self.rank).to(torch.int8).to(self.device)
+        scale = (torch.arange(4, dtype=torch.float32) + self.rank * 4).to(self.device)
+
+        os.environ["CUSTOM_COMM_USE_CCU"]     = "1"
+        os.environ["CUSTOM_COMM_CCU_MODE"]    = "ms"
+        os.environ["CUSTOM_COMM_CCU_MS_IMPL"] = "v2"
+        try:
+            out_data, out_scale = torch.ops.custom_comm.allgather_batch(
+                [data, scale], self.hcom, self.world_size
+            )
+        finally:
+            os.environ.pop("CUSTOM_COMM_USE_CCU", None)
+            os.environ.pop("CUSTOM_COMM_CCU_MODE", None)
+            os.environ.pop("CUSTOM_COMM_CCU_MS_IMPL", None)
+
+        expected_data = torch.cat([
+            (torch.arange(256) + r).to(torch.int8) for r in range(self.world_size)
+        ]).to(self.device)
+        expected_scale = torch.arange(4 * self.world_size, dtype=torch.float32).to(self.device)
+
+        assert torch.equal(out_data, expected_data)
+        assert torch.equal(out_scale, expected_scale)
