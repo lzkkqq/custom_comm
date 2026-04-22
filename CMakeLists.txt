@@ -22,6 +22,7 @@ add_library(custom_comm_ops SHARED ${CUSTOM_COMM_SOURCES})
 target_include_directories(custom_comm_ops PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ops/allgather_batch/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/ops/allgather_batch/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/ops/op_common/inc
     ${CANN_INCLUDE_DIRS}
     ${CANN_PKG_INC_DIRS}
 )
