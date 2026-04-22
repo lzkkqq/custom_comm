@@ -74,6 +74,26 @@ def pytest_collection_modifyitems(config, items):
                 break
 
 
+def _ccu_ms_pg_options():
+    """Build ProcessGroupHCCL.Options forcing op-expansion-mode=CCU_MS (5).
+
+    Without this, HCCL defaults the per-comm expansion mode to SCHED, which
+    eagerly pre-allocates die-local block resources (blockMsReq / blockCke /
+    blockLoopEngine). Later, when our V2 kernel calls HcclCcuKernelRegister,
+    the CCU resource manager sees die1 already saturated and returns
+    HCCL error 7 (CheckResIfAvailable). Declaring CCU_MS up front reserves
+    the right pool shape from the start and matches ccu_ms_bench.py.
+    """
+    try:
+        import torch_npu  # noqa: F401
+        opt = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+        opt.hccl_config = {"hccl_op_expansion_mode": 5}  # CCU_MS
+        return opt
+    except Exception:
+        # torch_npu missing or API shape changed: fall back to default init.
+        return None
+
+
 @pytest.fixture(scope="session")
 def dist_ctx():
     """Session-scoped HCCL context: rank, world_size, device, hcom."""
@@ -85,7 +105,7 @@ def dist_ctx():
     import torch_npu  # noqa: F401
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="hccl")
+        dist.init_process_group(backend="hccl", pg_options=_ccu_ms_pg_options())
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
