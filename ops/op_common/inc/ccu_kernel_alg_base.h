@@ -52,6 +52,13 @@ struct GroupOpSizeResource {
 // One entry in a batched broadcast. `gate` is a Variable whose runtime value
 // is non-zero iff this desc carries data; typically the caller binds it to
 // the Variable holding sendBytes so an empty desc emits no DSL.
+//
+// Caller contract: each item's `src` and every entry of `dst` MUST come from
+// independent CreateLocalAddr() / CreateRemoteAddr() calls. GroupBroadcastBatch
+// emits `src.addr += offset` / `dst[i].addr += offset` as microcode; because
+// CcuRep::Address is backed by a shared_ptr<CcuPhyRes>, reusing the same
+// Address across items would accumulate offsets across iterations and corrupt
+// later descs.
 struct BroadcastItem {
     hcomm::CcuRep::LocalAddr                src;
     std::vector<hcomm::CcuRep::RemoteAddr>  dst;    // size == channels.size() + 1
