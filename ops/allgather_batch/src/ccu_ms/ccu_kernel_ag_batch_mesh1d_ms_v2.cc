@@ -66,9 +66,12 @@ static constexpr uint32_t V2_GENE_ARGS_DESC_BASE = 1;
 static constexpr uint32_t V2_GENE_ARGS_TOTAL     =
     V2_GENE_ARGS_DESC_BASE + V2_GENE_ARGS_PER_DESC * MAX_DESC_COUNT;
 
-// Both the host-side CalGoSize slice layout and the device-side LoopGroup[0]
-// paraCfg (moConfig.loopCount - 1) derive from this; keep them in lockstep.
-static constexpr uint32_t kV2ParallelDim = 8;
+// Hardware invariant: a LoopGroup fans out exactly 64 Loops in parallel
+// (CCU_MS_DEFAULT_LOOP_COUNT). The host-side slice formula m*256KB + n*4KB + p
+// is derived from this 64-way parallelism (256KB = 64 * 4KB). Both the
+// AllocGoResource parallelDim and the CalGoSize parallelDim MUST be 64.
+static constexpr uint32_t kV2ParallelDim =
+    static_cast<uint32_t>(::custom_comm::ms::kCcuMsDefaultLoopCount);
 
 // ============================================================
 // CcuKernelArg subclass (registration-time, per-rank-size signature)
@@ -174,13 +177,10 @@ HcclResult CcuKernelAllGatherBatchMesh1DMsV2::Algorithm() {
 
     const uint32_t numPeers = rankSize_ - 1;
 
-    // AllocGoResource(parallelDim=kV2ParallelDim) -- deliberately low-parallelism.
-    // The hccl default parallelDim=64 allocates 64 executors/events and 512
-    // CcuBufs, blowing past the per-die MS budget (observed: blockMsReq=384 >
-    // die cap). batch workloads here run many small descs, not one big one, so
-    // 8-way parallelism is plenty and keeps resource usage on par with v1.
-    // The host-side CalGoSize in LaunchBatchedAGKernelMsV2 uses the same
-    // kV2ParallelDim so goSize.addrOffset matches what LoopGroup[0] consumes.
+    // Must match the hardware 64-way LoopGroup fan-out; see kV2ParallelDim.
+    // An earlier attempt at parallelDim=8 to reduce blockMsReq caused offset
+    // drift between host-side slice layout and device-side LoopGroup fan-out,
+    // producing the race-like failures seen in size_boundary.
     AllocGoResource(/*parallelDim=*/kV2ParallelDim, /*msPerLoop=*/1);
 
     // ---- Per-desc Variables mirroring the GeneArgs slot layout ----

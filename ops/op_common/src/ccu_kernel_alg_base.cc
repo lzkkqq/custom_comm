@@ -67,7 +67,13 @@ ms::GoSize CalGoSize(uint64_t size, uint32_t parallelDim) {
 
     ms::GoSize go{};
     go.addrOffset = loopIterNum * loopSize;
-    go.loopParam  = ms::GetLoopParam(0, loopSize, loopIterNum);
+    // NOTE: loopParam carries only the raw loopIterNum (iter field). The
+    // device-side Algorithm in GroupBroadcastBatch bit-packs the full
+    // GetLoopParam(0, loopSize, 0) there and does `loopParam += goSize.loopParam`,
+    // which only adds to the iter field. If we bit-packed loopSize here too,
+    // the gsa field would double and each serial round would stride by
+    // 2*loopSize, skipping half of the payload.
+    go.loopParam  = loopIterNum;
     if (n == 0 && p == 0) {
         go.parallelParam = 0;
         go.residual      = 0;
