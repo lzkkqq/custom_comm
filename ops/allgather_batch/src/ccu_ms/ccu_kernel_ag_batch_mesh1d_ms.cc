@@ -268,12 +268,14 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
     // Single CompletedEvent tracks all WriteNb/LocalCopyNb completions
     CompletedEvent event = CreateCompletedEvent();
 
-    // Single-slot staging area (1 CcuBuf + 1 Executor).  The broadcast
-    // LoopBlock below reuses this slot for every desc / every iteration;
-    // LoopGroupCall drives loopIterNum[d] tiles per desc so payload size
-    // is no longer capped at CCU_MS_SIZE.
-    std::vector<CcuBuf> stagingBuf(1);
-    CreateBlockCcuBuf(1, stagingBuf.data());
+    // Staging area sized to the LoopGroup's hardware pipeline width.  Even
+    // when loopIterNum == 1 the translator strides MS slots by
+    // kCcuMsInterleave per iteration, so a single-slot CcuBuf leaves later
+    // lanes (self-copy in particular) writing into uninitialized storage.
+    // Matches HCCL's `CreateBlockCcuBuf(loopCount * msInterleave)` pattern
+    // (see ccu_kernel_alg_base.cc CreateMultiOp{Broadcast,Reduce}*).
+    std::vector<CcuBuf> stagingBuf(kCcuMsInterleave);
+    CreateBlockCcuBuf(kCcuMsInterleave, stagingBuf.data());
     std::vector<CcuRep::Executor> executors(1);
     CreateBlockExecutor(1, executors.data());
 
@@ -399,7 +401,12 @@ HcclResult CcuKernelAllGatherBatchMesh1DMs::Algorithm() {
             paraCfg = GetParallelParam(0, 0, 1);
 
             Variable offCfg = CreateVariable();
-            offCfg = GetOffsetParam(kCcuMsSize, kCcuMsInterleave, 0);
+            // ckeOffset=1 matches every HCCL reference call site (e.g.
+            // ccu_kernel_alg_base.cc:181,218); ckeOffset=0 leaves the
+            // per-iteration CKE advance unset, which for LoopGroupCall
+            // is wrong even at loopIterNum=1 because the hardware still
+            // schedules a prefetch lane.
+            offCfg = GetOffsetParam(kCcuMsSize, kCcuMsInterleave, 1);
 
             CcuRep::LoopGroupCall lgc(this, "agbatch_bcast_grp");
             lgc.Run({loopCall}, {loopCfg}, {executors[0]}, paraCfg, offCfg);
