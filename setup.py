@@ -25,10 +25,26 @@ segment. See issue #10 for the ABI-boundary background.
 
 import os
 import subprocess
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from setuptools import setup
+
+
+_TTY = sys.stdout.isatty()
+_BOLD  = "\033[1m"  if _TTY else ""
+_DIM   = "\033[2m"  if _TTY else ""
+_CYAN  = "\033[36m" if _TTY else ""
+_RED   = "\033[31m" if _TTY else ""
+_GREEN = "\033[32m" if _TTY else ""
+_RESET = "\033[0m"  if _TTY else ""
+
+_TAG = f"{_CYAN}{_BOLD}[custom_comm]{_RESET}"
+
+def _log(msg: str) -> None:
+    print(f"{_TAG} {msg}", flush=True)
 
 
 HERE = Path(__file__).resolve().parent
@@ -104,6 +120,10 @@ _SHIM_INCLUDES = (
 )
 
 
+_progress_lock = threading.Lock()
+_progress = {"done": 0, "total": 0}
+
+
 def _compile_one(rel_src: str, obj_dir: str) -> str:
     """Compile a single source file into object file. Returns the .o path."""
     abs_src = HERE / rel_src
@@ -116,7 +136,7 @@ def _compile_one(rel_src: str, obj_dir: str) -> str:
         "-D_GLIBCXX_USE_CXX11_ABI=0",
         # torch_npu 2.9 bundles an older hccl_types.h that uses
         # HCCL_COMM_HCCL_QOS_CONFIG_NOT_SET; CANN 9.0 uses the shorter
-        # HCCL_COMM_QOS_CONFIG_NOT_SET. Remove this once the upstream is aligned.
+        # HCCL_COMM_QOS_CONFIG_NOT_SET. Remove this once upstream is aligned.
         "-DHCCL_COMM_HCCL_QOS_CONFIG_NOT_SET=HCCL_COMM_QOS_CONFIG_NOT_SET",
         "-fvisibility=default",
     ]
@@ -125,7 +145,27 @@ def _compile_one(rel_src: str, obj_dir: str) -> str:
     for isys in SDK_ISYSTEM:
         cmd += ["-isystem", isys]
     cmd += [str(abs_src), "-o", obj]
-    subprocess.check_call(cmd)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.stderr.write(f"\n[custom_comm] compile FAILED: {rel_src}\n")
+        sys.stderr.write(f"  $ {' '.join(cmd)}\n")
+        if result.stdout:
+            sys.stderr.write(result.stdout)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    if result.stderr.strip():
+        # forward warnings without failing
+        sys.stderr.write(result.stderr)
+
+    with _progress_lock:
+        _progress["done"] += 1
+        done = _progress["done"]
+        total = _progress["total"]
+    width = len(str(total))
+    print(f"  [{done:>{width}}/{total}] cc {rel_src}", flush=True)
     return obj
 
 
@@ -135,12 +175,14 @@ def build_shim():
     os.makedirs(obj_dir, exist_ok=True)
 
     jobs = int(os.environ.get("MAX_JOBS") or os.cpu_count() or 1)
-    print(f"[custom_comm] compiling {len(SHIM_SOURCES)} shim sources (MAX_JOBS={jobs})")
+    _progress["done"] = 0
+    _progress["total"] = len(SHIM_SOURCES)
+    _log(f"compiling {_progress['total']} shim sources (MAX_JOBS={jobs})")
+
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [pool.submit(_compile_one, s, obj_dir) for s in SHIM_SOURCES]
-        objs = [f.result() for f in futures]  # propagates exceptions
+        objs = [f.result() for f in futures]
 
-    # Link
     cxx = os.environ.get("CXX", "g++")
     link_cmd = [cxx, "-shared", "-fPIC",
                 f"-Wl,-soname,{SHIM_BASENAME}"] + objs
@@ -148,12 +190,25 @@ def build_shim():
         link_cmd += ["-L", libdir]
     link_cmd += ["-lhccl", "-lhcomm", "-lascendcl",
                  "-o", str(SHIM_OUT)]
-    subprocess.check_call(link_cmd)
+
+    _log(f"linking -> {SHIM_BASENAME}")
+    lr = subprocess.run(link_cmd, capture_output=True, text=True)
+    if lr.returncode != 0:
+        sys.stderr.write(f"\n{_RED}{_BOLD}[custom_comm] link failed{_RESET}\n")
+        sys.stderr.write(f"  $ {' '.join(link_cmd)}\n")
+        if lr.stdout:
+            sys.stderr.write(lr.stdout)
+        if lr.stderr:
+            sys.stderr.write(lr.stderr)
+        raise subprocess.CalledProcessError(lr.returncode, link_cmd)
+    if lr.stderr.strip():
+        sys.stderr.write(lr.stderr)
 
     _verify_shim_abi()
+    _log(f"{_GREEN}ok{_RESET}  {SHIM_OUT.relative_to(HERE)}")
 
 
-def _verify_shim_abi():
+def _verify_shim_abi() -> None:
     import shutil
     nm = shutil.which("nm")
     if not nm:
