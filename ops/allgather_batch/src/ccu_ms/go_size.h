@@ -31,11 +31,7 @@ uint64_t GetLoopParam(uint64_t loopCtxId, uint64_t gsaOffset, uint64_t loopIterN
 uint64_t GetParallelParam(uint64_t repeatNum, uint64_t repeatLoopIndex, uint64_t totalLoopNum);
 uint64_t GetOffsetParam(uint64_t gsaOffset, uint64_t msOffset, uint64_t ckeOffset);
 
-// parallelDim MUST equal the value passed to AllocGoResource() on the
-// consuming kernel; the host-side slice layout and the LoopGroup[0] paraCfg
-// both derive from it, and any drift will leave the tail of a large payload
-// unprocessed. Defaults to kCcuMsDefaultLoopCount (64) to match HCCL.
-GoSize CalGoSize(uint64_t totalBytes, uint32_t parallelDim = kCcuMsDefaultLoopCount);
+GoSize CalGoSize(uint64_t totalBytes);
 
 }  // namespace ms
 }  // namespace custom_comm

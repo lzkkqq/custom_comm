@@ -328,9 +328,12 @@ HcclResult LaunchBatchedAGKernelMsV2(
         ccuArg.selfOffset[d] = static_cast<uint64_t>(taskArg.rankId) * bytes;
         ccuArg.sendBytes[d]  = bytes;
         // parallelDim must match AllocGoResource(parallelDim) inside
-        // Algorithm(); see kV2ParallelDim below.
-        ccuArg.goSize[d]     = bytes == 0 ? GoSize{}
-                                          : CalGoSize(bytes, kV2ParallelDim);
+        // Algorithm(); see kV2ParallelDim below. Uses the parallelDim-aware
+        // overload defined in ccu_kernel_alg_base.cc, not the V1-shared
+        // ms::CalGoSize (which hard-codes parallelDim=64).
+        ccuArg.goSize[d]     = bytes == 0
+            ? GoSize{}
+            : ::custom_comm::ccu_base::CalGoSize(bytes, kV2ParallelDim);
     }
 
     // Token from the first active desc (skip zero-sized descs).

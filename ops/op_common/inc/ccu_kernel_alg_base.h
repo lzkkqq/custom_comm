@@ -26,8 +26,19 @@
 #include <hccl/hccl_types.h>
 #include <hcomm/ccu/ccu_kernel.h>
 
+#include "ccu_ms/go_size.h"
+
 namespace custom_comm {
 namespace ccu_base {
+
+// parallelDim-aware variant of ms::CalGoSize for batched kernels built on
+// CcuKernelAlgBase. The canonical ms::CalGoSize hard-codes parallelDim=64
+// (HCCL default) and is shared with V1; V2 uses a reduced parallelDim to
+// stay under the per-die MS budget, so it needs the split to be computed
+// from the same value it passes to AllocGoResource(). parallelDim MUST
+// equal the value used at AllocGoResource time; any drift leaves the tail
+// of a large payload unprocessed.
+ms::GoSize CalGoSize(uint64_t totalBytes, uint32_t parallelDim);
 
 // Four Variables that host-side CalGoSize produces and the inlined DSL in
 // GroupBroadcastBatch consumes. Layout kept structurally identical to hccl's

@@ -48,6 +48,43 @@ namespace ccu_base {
 namespace ms = ::custom_comm::ms;  // go_size.h constants + bit-pack helpers
 
 // ============================================================
+// CalGoSize (parallelDim-aware)
+//
+// Mirrors ms::CalGoSize in go_size.cc but takes parallelDim as a parameter
+// so batched kernels that pick a non-default AllocGoResource(parallelDim)
+// can compute a matching host-side split. Kept out of go_size.{h,cc} so the
+// V1 kernel's ms::CalGoSize signature stays untouched.
+// ============================================================
+
+ms::GoSize CalGoSize(uint64_t size, uint32_t parallelDim) {
+    const uint64_t memSlice = ms::kCcuMsSize;
+    const uint64_t loopSize = memSlice * parallelDim;
+
+    uint64_t loopIterNum = size / loopSize;
+    uint64_t leftover    = size - loopIterNum * loopSize;
+    uint64_t n           = leftover / memSlice;
+    uint64_t p           = leftover - n * memSlice;
+
+    ms::GoSize go{};
+    go.addrOffset = loopIterNum * loopSize;
+    go.loopParam  = ms::GetLoopParam(0, loopSize, loopIterNum);
+    if (n == 0 && p == 0) {
+        go.parallelParam = 0;
+        go.residual      = 0;
+    } else if (n != 0 && p == 0) {
+        go.parallelParam = ms::GetParallelParam(n - 1, 0, 1);
+        go.residual      = memSlice;
+    } else if (n == 0 && p != 0) {
+        go.parallelParam = ms::GetParallelParam(0, 0, 1);
+        go.residual      = p;
+    } else {
+        go.parallelParam = ms::GetParallelParam(n - 1, 1, 2);
+        go.residual      = p;
+    }
+    return go;
+}
+
+// ============================================================
 // AllocGoResource
 // ============================================================
 
