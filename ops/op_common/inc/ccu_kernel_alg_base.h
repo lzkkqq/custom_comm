@@ -3,13 +3,14 @@
 //
 // Minimal CcuKernelAlgBase for custom_comm, adapted from hccl's
 // src/ops/op_common/template/ccu/ccu_kernel_alg_base.{h,cc} (Apache-2.0,
-// (c) 2025 Huawei). Provides the AllocGoResource / CreateMultiOpBroadcast /
-// GroupBroadcast pattern plus a batched variant GroupBroadcastBatch so
-// custom_comm kernels can consume the hccl MS+Loop abstraction using only
-// CANN SDK public symbols (hcomm::CcuKernel protected methods + CcuRep DSL).
+// (c) 2025 Huawei). Exposes a single batched entry point -- GroupBroadcastBatch
+// -- plus the AllocGoResource / LoopGroup / CreateBlock* plumbing it needs,
+// using only CANN SDK public symbols (hcomm::CcuKernel protected methods +
+// CcuRep DSL).
 //
-// Scope: AllGather-flavored broadcast only. GroupReduce / GroupLocalReduce /
-// GroupCopy / *WithoutMyRank are intentionally NOT ported.
+// Scope: AllGather-flavored batched broadcast only. Single-desc GroupBroadcast
+// and GroupReduce / GroupLocalReduce / GroupCopy / *WithoutMyRank variants are
+// intentionally NOT ported -- custom_comm's kernels all take the batch path.
 //
 // Naming: member fields follow hccl's convention (moConfig / moRes, no
 // trailing underscore) so that these DO NOT shadow the same-named
@@ -28,9 +29,10 @@
 namespace custom_comm {
 namespace ccu_base {
 
-// Four Variables that CalGoSize produces and GroupBroadcast consumes.
-// Kept structurally identical to hccl's ops_hccl::CcuKernelAlgBase::GroupOpSize
-// so the port of GroupBroadcast is a direct copy.
+// Four Variables that host-side CalGoSize produces and the inlined DSL in
+// GroupBroadcastBatch consumes. Layout kept structurally identical to hccl's
+// ops_hccl::CcuKernelAlgBase::GroupOpSize so any future port of a single-desc
+// GroupBroadcast remains a direct copy.
 struct GroupOpSize {
     hcomm::CcuRep::Variable addrOffset;     // first loopgroup total offset
     hcomm::CcuRep::Variable loopParam;      // serial iter count (ctx | gsa | iter)
@@ -90,21 +92,17 @@ protected:
                    const hcomm::CcuRep::Variable& paraCfg,
                    const hcomm::CcuRep::Variable& offsetCfg);
 
-    // Emit the microcode for a single-src / (numPeers + 1)-dst broadcast.
-    // Registers the shared LoopBlock the first time it's called (idempotent
-    // via registeredLoop).
-    HcclResult GroupBroadcast(const std::vector<ChannelHandle>& channels,
-                              std::vector<hcomm::CcuRep::RemoteAddr> dst,
-                              hcomm::CcuRep::LocalAddr src,
-                              GroupOpSize goSize);
-
     // Emit DSL for a batch of broadcasts, one per item, guarded by
     // CCU_IF(gate != 0) so items with empty payload contribute no microcode.
+    // Self-contained: does not delegate to a per-desc GroupBroadcast. Uses
+    // its own LoopBlock registration ("broadcast_batch_loop_*") so future
+    // batch-specific optimizations can land without affecting any single-desc
+    // broadcast path.
     HcclResult GroupBroadcastBatch(const std::vector<ChannelHandle>& channels,
                                    const std::vector<BroadcastItem>& items);
 
 private:
-    HcclResult CreateMultiOpBroadcast(const std::vector<ChannelHandle>& channels);
+    HcclResult CreateMultiOpBroadcastBatch(const std::vector<ChannelHandle>& channels);
 };
 
 }  // namespace ccu_base

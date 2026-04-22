@@ -252,8 +252,9 @@ HcclResult CcuKernelAllGatherBatchMesh1DMsV2::Algorithm() {
             dst.push_back(r);
         }
 
-        // Self slot: [numPeers]. CreateMultiOpBroadcast reinterprets this as
-        // a LocalAddr for LocalCopyNb, so the binary layout must stay intact.
+        // Self slot: [numPeers]. CreateMultiOpBroadcastBatch reinterprets
+        // this as a LocalAddr for LocalCopyNb, so the binary layout must
+        // stay intact.
         RemoteAddr selfR = CreateRemoteAddr();
         selfR.addr  = recvAddr[d];
         selfR.addr += selfOffset[d];

@@ -5,9 +5,12 @@
 //   src/ops/op_common/template/ccu/ccu_kernel_alg_base.cc (Apache-2.0,
 //   Copyright 2025 Huawei Technologies Co., Ltd.)
 //
-// Only the AllGather-flavored broadcast subset is ported: AllocGoResource,
-// CreateMultiOpBroadcast, GroupBroadcast, plus the new GroupBroadcastBatch
-// that iterates items and guards each one with CCU_IF(gate != 0).
+// custom_comm only needs the batched broadcast flavor, so this file exposes
+// a single entry point: GroupBroadcastBatch. The two-LoopGroup split (one
+// for integer multiples of memSlice*loopCount, one for the tail slab) is
+// inlined directly inside GroupBroadcastBatch; there is no single-desc
+// GroupBroadcast helper. CreateMultiOpBroadcastBatch registers the shared
+// LoopBlock ("broadcast_batch_loop_*") exactly once per kernel instance.
 //
 // Bit-packing helpers (GetLoopParam / GetParallelParam / GetOffsetParam /
 // CalGoSize) live in ops/allgather_batch/src/ccu_ms/go_size.{h,cc} and are
@@ -85,16 +88,18 @@ void CcuKernelAlgBase::Load(const GroupOpSize& goSize) {
 }
 
 // ============================================================
-// CreateMultiOpBroadcast -- one-time LoopBlock registration
+// CreateMultiOpBroadcastBatch -- one-time LoopBlock registration.
+// Uses the "broadcast_batch_loop_*" label namespace so it stays independent
+// of any future single-desc GroupBroadcast port.
 // ============================================================
 
-HcclResult CcuKernelAlgBase::CreateMultiOpBroadcast(
+HcclResult CcuKernelAlgBase::CreateMultiOpBroadcastBatch(
         const std::vector<ChannelHandle>& channels) {
     using namespace hcomm;  // Loop/WriteNb/WaitEvent/CcuRep names
 
     AllocGoResource();
 
-    const std::string loopType = "broadcast";
+    const std::string loopType = "broadcast_batch";
     if (registeredLoop.find(loopType) != registeredLoop.end()) {
         return HCCL_SUCCESS;
     }
@@ -139,88 +144,85 @@ HcclResult CcuKernelAlgBase::CreateMultiOpBroadcast(
 }
 
 // ============================================================
-// GroupBroadcast -- single-src / (N+1)-dst fan-out, split into two
-// LoopGroups covering the data-size-class the payload falls into.
-// ============================================================
-
-HcclResult CcuKernelAlgBase::GroupBroadcast(
-        const std::vector<ChannelHandle>& channels,
-        std::vector<hcomm::CcuRep::RemoteAddr> dst,
-        hcomm::CcuRep::LocalAddr src,
-        GroupOpSize goSize) {
-    using namespace hcomm;  // CCU_IF / CcuRep / Loop
-
-    CHK_RET_LOCAL(CreateMultiOpBroadcast(channels));
-
-    const uint32_t size = static_cast<uint32_t>(channels.size()) + 1;
-
-    // First LoopGroup: integer multiples of (memSlice * loopCount).
-    CCU_IF(goSize.addrOffset != 0) {
-        CcuRep::Variable loopParam = CreateVariable();
-        loopParam = ms::GetLoopParam(0, moConfig.memSlice * moConfig.loopCount, 0);
-        loopParam += goSize.loopParam;
-
-        CcuRep::Variable sliceSize = CreateVariable();
-        sliceSize = moConfig.memSlice;
-        auto lc = Loop("broadcast_loop_0")(src, dst, sliceSize);
-
-        CcuRep::Variable paraCfg = CreateVariable();
-        paraCfg = ms::GetParallelParam(moConfig.loopCount - 1, 0, 1);
-        CcuRep::Variable offsetCfg = CreateVariable();
-        offsetCfg = ms::GetOffsetParam(moConfig.memSlice, moConfig.msInterleave, 1);
-
-        LoopGroup({lc}, {loopParam}, paraCfg, offsetCfg);
-    }
-
-    // Second LoopGroup: tail slab (n full slices + residual p).
-    CCU_IF(goSize.parallelParam != 0) {
-        src.addr += goSize.addrOffset;
-        for (uint32_t i = 0; i < size; ++i) {
-            dst[i].addr += goSize.addrOffset;
-        }
-
-        auto lc0 = Loop("broadcast_loop_0")(src, dst, goSize.residual);
-
-        src.addr += goSize.residual;
-        for (uint32_t i = 0; i < size; ++i) {
-            dst[i].addr += goSize.residual;
-        }
-
-        CcuRep::Variable sliceSize = CreateVariable();
-        sliceSize = moConfig.memSlice;
-        auto lc1 = Loop("broadcast_loop_1")(src, dst, sliceSize);
-
-        CcuRep::Variable loopCfg0 = CreateVariable();
-        loopCfg0 = ms::GetLoopParam(0, 0, 1);
-        CcuRep::Variable loopCfg1 = CreateVariable();
-        loopCfg1 = ms::GetLoopParam(0, 0, 1);
-        CcuRep::Variable offsetCfg = CreateVariable();
-        offsetCfg = ms::GetOffsetParam(moConfig.memSlice, moConfig.msInterleave, 1);
-
-        LoopGroup({lc0, lc1}, {loopCfg0, loopCfg1}, goSize.parallelParam, offsetCfg);
-    }
-    return HCCL_SUCCESS;
-}
-
-// ============================================================
-// GroupBroadcastBatch -- per-item CCU_IF(gate != 0) wrapped GroupBroadcast
+// GroupBroadcastBatch -- self-contained multi-desc broadcast.
+//
+// For each item: guard with CCU_IF(gate != 0); if active, emit the same
+// two-LoopGroup split that CalGoSize produces on the host side:
+//   - LoopGroup[0] handles integer multiples of (memSlice * loopCount)
+//     using loopIterNum serial iterations
+//   - LoopGroup[1] handles the tail (n full slices + residual p) in one
+//     parallel expansion
+//
+// src / dst are taken by value from item so mutations inside CCU_IF blocks
+// are local to this iteration.
 // ============================================================
 
 HcclResult CcuKernelAlgBase::GroupBroadcastBatch(
         const std::vector<ChannelHandle>& channels,
         const std::vector<BroadcastItem>& items) {
-    using namespace hcomm;  // CCU_IF
+    using namespace hcomm;
 
-    CHK_RET_LOCAL(CreateMultiOpBroadcast(channels));
+    CHK_RET_LOCAL(CreateMultiOpBroadcastBatch(channels));
+
+    const uint32_t size = static_cast<uint32_t>(channels.size()) + 1;
 
     for (const auto& item : items) {
-        if (item.dst.size() != channels.size() + 1) {
-            CC_LOG_ERROR("GroupBroadcastBatch: item.dst size=%zu != channels+1=%zu",
-                         item.dst.size(), channels.size() + 1);
+        if (item.dst.size() != size) {
+            CC_LOG_ERROR("GroupBroadcastBatch: item.dst size=%zu != channels+1=%u",
+                         item.dst.size(), size);
             return HCCL_E_PARA;
         }
+
         CCU_IF(item.gate != 0) {
-            CHK_RET_LOCAL(GroupBroadcast(channels, item.dst, item.src, item.goSize));
+            auto              src    = item.src;
+            auto              dst    = item.dst;
+            const auto       &goSize = item.goSize;
+
+            // LoopGroup[0]: integer multiples of (memSlice * loopCount)
+            CCU_IF(goSize.addrOffset != 0) {
+                CcuRep::Variable loopParam = CreateVariable();
+                loopParam = ms::GetLoopParam(0, moConfig.memSlice * moConfig.loopCount, 0);
+                loopParam += goSize.loopParam;
+
+                CcuRep::Variable sliceSize = CreateVariable();
+                sliceSize = moConfig.memSlice;
+                auto lc = Loop("broadcast_batch_loop_0")(src, dst, sliceSize);
+
+                CcuRep::Variable paraCfg = CreateVariable();
+                paraCfg = ms::GetParallelParam(moConfig.loopCount - 1, 0, 1);
+                CcuRep::Variable offsetCfg = CreateVariable();
+                offsetCfg = ms::GetOffsetParam(moConfig.memSlice, moConfig.msInterleave, 1);
+
+                LoopGroup({lc}, {loopParam}, paraCfg, offsetCfg);
+            }
+
+            // LoopGroup[1]: tail slab (n full slices + residual p)
+            CCU_IF(goSize.parallelParam != 0) {
+                src.addr += goSize.addrOffset;
+                for (uint32_t i = 0; i < size; ++i) {
+                    dst[i].addr += goSize.addrOffset;
+                }
+
+                auto lc0 = Loop("broadcast_batch_loop_0")(src, dst, goSize.residual);
+
+                src.addr += goSize.residual;
+                for (uint32_t i = 0; i < size; ++i) {
+                    dst[i].addr += goSize.residual;
+                }
+
+                CcuRep::Variable sliceSize = CreateVariable();
+                sliceSize = moConfig.memSlice;
+                auto lc1 = Loop("broadcast_batch_loop_1")(src, dst, sliceSize);
+
+                CcuRep::Variable loopCfg0 = CreateVariable();
+                loopCfg0 = ms::GetLoopParam(0, 0, 1);
+                CcuRep::Variable loopCfg1 = CreateVariable();
+                loopCfg1 = ms::GetLoopParam(0, 0, 1);
+                CcuRep::Variable offsetCfg = CreateVariable();
+                offsetCfg = ms::GetOffsetParam(moConfig.memSlice, moConfig.msInterleave, 1);
+
+                LoopGroup({lc0, lc1}, {loopCfg0, loopCfg1}, goSize.parallelParam, offsetCfg);
+            }
         }
     }
     return HCCL_SUCCESS;
