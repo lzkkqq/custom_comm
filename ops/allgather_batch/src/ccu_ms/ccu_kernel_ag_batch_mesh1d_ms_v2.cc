@@ -66,6 +66,10 @@ static constexpr uint32_t V2_GENE_ARGS_DESC_BASE = 1;
 static constexpr uint32_t V2_GENE_ARGS_TOTAL     =
     V2_GENE_ARGS_DESC_BASE + V2_GENE_ARGS_PER_DESC * MAX_DESC_COUNT;
 
+// Both the host-side CalGoSize slice layout and the device-side LoopGroup[0]
+// paraCfg (moConfig.loopCount - 1) derive from this; keep them in lockstep.
+static constexpr uint32_t kV2ParallelDim = 8;
+
 // ============================================================
 // CcuKernelArg subclass (registration-time, per-rank-size signature)
 // ============================================================
@@ -170,12 +174,14 @@ HcclResult CcuKernelAllGatherBatchMesh1DMsV2::Algorithm() {
 
     const uint32_t numPeers = rankSize_ - 1;
 
-    // AllocGoResource(parallelDim=8) -- deliberately low-parallelism. The hccl
-    // default parallelDim=64 allocates 64 executors/events and 512 CcuBufs,
-    // blowing past the per-die MS budget (observed: blockMsReq=384 > die cap).
-    // batch workloads here run many small descs, not one big one, so 8-way
-    // parallelism is plenty and keeps resource usage on par with v1.
-    AllocGoResource(/*parallelDim=*/8, /*msPerLoop=*/1);
+    // AllocGoResource(parallelDim=kV2ParallelDim) -- deliberately low-parallelism.
+    // The hccl default parallelDim=64 allocates 64 executors/events and 512
+    // CcuBufs, blowing past the per-die MS budget (observed: blockMsReq=384 >
+    // die cap). batch workloads here run many small descs, not one big one, so
+    // 8-way parallelism is plenty and keeps resource usage on par with v1.
+    // The host-side CalGoSize in LaunchBatchedAGKernelMsV2 uses the same
+    // kV2ParallelDim so goSize.addrOffset matches what LoopGroup[0] consumes.
+    AllocGoResource(/*parallelDim=*/kV2ParallelDim, /*msPerLoop=*/1);
 
     // ---- Per-desc Variables mirroring the GeneArgs slot layout ----
     Variable token = CreateVariable();
@@ -321,7 +327,10 @@ HcclResult LaunchBatchedAGKernelMsV2(
         ccuArg.recvAddr[d]   = reinterpret_cast<uint64_t>(taskArg.descs[d].recvBuf);
         ccuArg.selfOffset[d] = static_cast<uint64_t>(taskArg.rankId) * bytes;
         ccuArg.sendBytes[d]  = bytes;
-        ccuArg.goSize[d]     = bytes == 0 ? GoSize{} : CalGoSize(bytes);
+        // parallelDim must match AllocGoResource(parallelDim) inside
+        // Algorithm(); see kV2ParallelDim below.
+        ccuArg.goSize[d]     = bytes == 0 ? GoSize{}
+                                          : CalGoSize(bytes, kV2ParallelDim);
     }
 
     // Token from the first active desc (skip zero-sized descs).

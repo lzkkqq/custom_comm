@@ -61,10 +61,9 @@ uint64_t GetOffsetParam(uint64_t gsaOffset, uint64_t msOffset, uint64_t ckeOffse
          | ((ckeOffset & Mask(kCkeBits)) << kCkeShift);
 }
 
-GoSize CalGoSize(uint64_t size) {
-    const uint64_t memSlice     = kCcuMsSize;
-    const uint64_t parallelDim  = kCcuMsDefaultLoopCount;
-    const uint64_t loopSize     = memSlice * parallelDim;
+GoSize CalGoSize(uint64_t size, uint32_t parallelDim) {
+    const uint64_t memSlice = kCcuMsSize;
+    const uint64_t loopSize = memSlice * parallelDim;
 
     uint64_t loopIterNum = size / loopSize;
     uint64_t leftover    = size - loopIterNum * loopSize;
