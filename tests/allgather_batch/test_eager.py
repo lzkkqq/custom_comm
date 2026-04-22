@@ -190,29 +190,23 @@ class TestCcuPath:
         assert torch.equal(out_scale, expected_scale)
 
     @pytest.mark.parametrize("bytes_per_desc", [
-        1024,     # 1 KB -- well under single-slot limit
-        2048,     # 2 KB
-        4096,     # 4 KB -- exactly CCU_MS_SIZE, right at the boundary
-        4097,     # 4 KB + 1 -- first size past single-slot capacity
-        8192,     # 8 KB -- 2x single slot; should fail on Phase 2b-alpha
-        65536,    # 64 KB -- many slots; definitely needs Phase 2b-gamma
+        256,
+        1024,
+        2048,
+        4096,
+        4097,
+        8192,
+        65536,
     ])
     def test_ccu_ms_size_boundary(self, bytes_per_desc):
-        """Probe CalGoSize boundaries: small -> 4 KB -> multi-slot.
-
-        For each payload size, run MS path and diff against SCHED path.
-        If Phase 2b-alpha's single-slot CcuBuf has a 4 KiB limit, writing
-        sizes >= 4 KiB will either drop data silently or trigger a kernel
-        error. The assertion below catches both.
-
-        Before running: export CUSTOM_COMM_CCU_MODE (handled per-case).
+        """CCU_MS kernel at various sizes, validated against a deterministic
+        Python-computed reference (no coupling to the SCHED backend, which may
+        itself contain latent bugs).
         """
         import os
-        # Use deterministic per-rank payload
-        n_elts = bytes_per_desc
-        data = (torch.arange(n_elts, dtype=torch.int8) + self.rank).to(self.device)
+        n = bytes_per_desc
+        data = (torch.arange(n, dtype=torch.int64) + self.rank).to(torch.int8).to(self.device)
 
-        # Run MS path
         os.environ["CUSTOM_COMM_USE_CCU"] = "1"
         os.environ["CUSTOM_COMM_CCU_MODE"] = "ms"
         os.environ["CUSTOM_COMM_CCU_MS_DIAG"] = "1"
@@ -220,17 +214,17 @@ class TestCcuPath:
             [out_ms] = torch.ops.custom_comm.allgather_batch(
                 [data], self.hcom, self.world_size)
         finally:
-            pass
+            os.environ.pop("CUSTOM_COMM_USE_CCU", None)
+            os.environ.pop("CUSTOM_COMM_CCU_MODE", None)
+            os.environ.pop("CUSTOM_COMM_CCU_MS_DIAG", None)
 
-        # Run SCHED path (reference truth)
-        os.environ["CUSTOM_COMM_CCU_MODE"] = "sched"
-        [out_sched] = torch.ops.custom_comm.allgather_batch(
-            [data], self.hcom, self.world_size)
+        expected = torch.cat([
+            (torch.arange(n, dtype=torch.int64) + r).to(torch.int8)
+            for r in range(self.world_size)
+        ]).to(self.device)
 
-        os.environ.pop("CUSTOM_COMM_USE_CCU", None)
-        os.environ.pop("CUSTOM_COMM_CCU_MODE", None)
-        os.environ.pop("CUSTOM_COMM_CCU_MS_DIAG", None)
-
-        assert torch.equal(out_ms, out_sched), (
-            f"MS vs SCHED mismatch at bytes_per_desc={bytes_per_desc}; "
-            f"diff at {(out_ms != out_sched).nonzero()}")
+        diff_idx = (out_ms != expected).nonzero()
+        assert torch.equal(out_ms, expected), (
+            f"bytes_per_desc={bytes_per_desc}: "
+            f"{diff_idx.numel()} / {expected.numel()} positions differ; "
+            f"first diff indices: {diff_idx[:10].flatten().tolist()}")
