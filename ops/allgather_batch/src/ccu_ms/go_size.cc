@@ -61,34 +61,6 @@ uint64_t GetOffsetParam(uint64_t gsaOffset, uint64_t msOffset, uint64_t ckeOffse
          | ((ckeOffset & Mask(kCkeBits)) << kCkeShift);
 }
 
-GoSize CalGoSize(uint64_t size) {
-    const uint64_t memSlice     = kCcuMsSize;
-    const uint64_t parallelDim  = kCcuMsDefaultLoopCount;
-    const uint64_t loopSize     = memSlice * parallelDim;
-
-    uint64_t loopIterNum = size / loopSize;
-    uint64_t leftover    = size - loopIterNum * loopSize;
-    uint64_t n           = leftover / memSlice;
-    uint64_t p           = leftover - n * memSlice;
-
-    GoSize go{};
-    go.addrOffset = loopIterNum * loopSize;
-    go.loopParam  = GetLoopParam(0, loopSize, loopIterNum);
-    if (n == 0 && p == 0) {
-        go.parallelParam = 0;
-        go.residual      = 0;
-    } else if (n != 0 && p == 0) {
-        go.parallelParam = GetParallelParam(n - 1, 0, 1);
-        go.residual      = memSlice;
-    } else if (n == 0 && p != 0) {
-        go.parallelParam = GetParallelParam(0, 0, 1);
-        go.residual      = p;
-    } else {
-        go.parallelParam = GetParallelParam(n - 1, 1, 2);
-        go.residual      = p;
-    }
-    return go;
-}
 
 }  // namespace ms
 }  // namespace custom_comm

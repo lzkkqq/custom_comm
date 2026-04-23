@@ -74,24 +74,19 @@ def pytest_collection_modifyitems(config, items):
                 break
 
 
-def _ccu_ms_pg_options():
-    """Build ProcessGroupHCCL.Options forcing op-expansion-mode=CCU_MS (5).
+def _hccl_pg_options():
+    """Build ProcessGroupHCCL.Options honouring $HCCL_OP_EXPANSION_MODE.
 
-    Without this, HCCL defaults the per-comm expansion mode to SCHED, which
-    eagerly pre-allocates die-local block resources (blockMsReq / blockCke /
-    blockLoopEngine). Later, when our V2 kernel calls HcclCcuKernelRegister,
-    the CCU resource manager sees die1 already saturated and returns
-    HCCL error 7 (CheckResIfAvailable). Declaring CCU_MS up front reserves
-    the right pool shape from the start and matches ccu_ms_bench.py.
+    torch_npu ignores HCCL_OP_EXPANSION_MODE when routing init_process_group,
+    so we read it here and thread the value into hccl_config. Default is
+    CCU_MS: without it HCCL picks SCHED, which pre-allocates die-local
+    blockMsReq / blockCke / blockLoopEngine resources and makes the V2
+    kernel's HcclCcuKernelRegister return HCCL error 7 (CheckResIfAvailable)
+    when the second PG tries to reserve its MS slots on die1.  Set
+    HCCL_OP_EXPANSION_MODE=NONE (or empty) to let HCCL pick.
     """
-    try:
-        import torch_npu  # noqa: F401
-        opt = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        opt.hccl_config = {"hccl_op_expansion_mode": 5}  # CCU_MS
-        return opt
-    except Exception:
-        # torch_npu missing or API shape changed: fall back to default init.
-        return None
+    from _hccl_modes import build_hccl_options_from_env
+    return build_hccl_options_from_env(default="CCU_MS")
 
 
 @pytest.fixture(scope="session")
@@ -105,7 +100,7 @@ def dist_ctx():
     import torch_npu  # noqa: F401
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="hccl", pg_options=_ccu_ms_pg_options())
+        dist.init_process_group(backend="hccl", pg_options=_hccl_pg_options())
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()

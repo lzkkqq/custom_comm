@@ -7,11 +7,7 @@
 //                 -> HcclThreadAcquire -> KernelRegisterFinish  (first call)
 //                 HcclEngineCtxGet (subsequent calls, cached)
 //
-// LaunchCcuKernel: HcclEngineCtxGet -> LaunchBatchedAGKernel{Ms, MsV2}
-//
-// CUSTOM_COMM_CCU_MS_IMPL env (unset/v1 -> v1 hand-rolled kernel;
-// v2 -> GroupBroadcastBatch-based kernel). V1 and V2 live in separate
-// EngineCtx slots so they don't cross-contaminate a cached comm.
+// LaunchCcuKernel: HcclEngineCtxGet -> LaunchBatchedAGKernelMs
 
 #include "engine_ctx_ms.h"
 #include "ccu_kernel_ag_batch_mesh1d_ms.h"
@@ -27,57 +23,23 @@
 #include <acl/acl.h>
 
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <vector>
 
 namespace custom_comm {
 namespace ms {
 
 // ============================================================
-// MsImpl selection (CUSTOM_COMM_CCU_MS_IMPL env var)
+// CcuContext -- cached in HcclEngineCtx
 // ============================================================
 
-enum class MsImpl : uint8_t {
-    kV1 = 0,
-    kV2 = 1,
-};
+static constexpr const char *kCtxTag = "custom_comm_ag_batch_ms";
 
-// Read-per-call: mirrors UseCcuPath() in all_gather_batch.cc so tests that
-// flip the env mid-process (e.g. test_ccu_ms_size_boundary) observe the new
-// value on the next invocation. Cheap: one getenv() + a couple of strcmp().
-static MsImpl GetMsImpl() {
-    const char *env = std::getenv("CUSTOM_COMM_CCU_MS_IMPL");
-    if (env == nullptr || env[0] == '\0') {
-        return MsImpl::kV1;
-    }
-    if (std::strcmp(env, "v1") == 0 || std::strcmp(env, "V1") == 0) {
-        return MsImpl::kV1;
-    }
-    if (std::strcmp(env, "v2") == 0 || std::strcmp(env, "V2") == 0) {
-        return MsImpl::kV2;
-    }
-    CC_LOG_ERROR("CUSTOM_COMM_CCU_MS_IMPL=%s not recognized; falling back to V1",
-                 env);
-    return MsImpl::kV1;
-}
-
-static const char *CtxTagFor(MsImpl impl) {
-    return impl == MsImpl::kV2 ? "custom_comm_ag_batch_ms_v2"
-                               : "custom_comm_ag_batch_ms";
-}
-
-// ============================================================
-// CcuContext -- stored in HcclEngineCtx, cached per (comm, tag)
-// ============================================================
-
-// XN IDs used: TOKEN(0), RECV_ADDR(1..MAX_DESC_COUNT), POST_SYNC(MAX_DESC_COUNT+1)
-static constexpr uint32_t NOTIFY_COUNT = 1 + MAX_DESC_COUNT + 1;  // 10
+// XN IDs: TOKEN(0), RECV_ADDR(1..MAX_DESC_COUNT), POST_SYNC(MAX_DESC_COUNT+1)
+static constexpr uint32_t NOTIFY_COUNT = 1 + MAX_DESC_COUNT + 1;
 
 struct CcuContext {
     CcuKernelHandle kernelHandle{};
     ThreadHandle    threadHandle{};
-    MsImpl          impl = MsImpl::kV1;
     bool            initialized = false;
 };
 
@@ -91,17 +53,13 @@ HcclResult InitCcuContext(HcclComm comm) {
         CC_LOG_ERROR("InitCcuContext: comm is null");
         return HCCL_E_PARA;
     }
-    const MsImpl impl = GetMsImpl();
-    const char  *tag  = CtxTagFor(impl);
-
     void *ctx = nullptr;
     uint64_t ctxSize = 0;
-    if (HcclEngineCtxGet(comm, tag, COMM_ENGINE_CCU,
+    if (HcclEngineCtxGet(comm, kCtxTag, COMM_ENGINE_CCU,
                          &ctx, &ctxSize) == HCCL_SUCCESS && ctx != nullptr) {
         auto *ccuCtx = static_cast<CcuContext *>(ctx);
         if (ccuCtx->initialized) {
-            CC_LOG_DEBUG("InitCcuContext: cached ctx hit (impl=V%d)",
-                         static_cast<int>(impl) + 1);
+            CC_LOG_DEBUG("InitCcuContext: cached ctx hit");
             return HCCL_SUCCESS;
         }
         // Partial init from a prior failed attempt: SDK resource cleanup
@@ -111,14 +69,12 @@ HcclResult InitCcuContext(HcclComm comm) {
     }
 
     // Slow path: first call -- allocate + register
-    CC_LOG_INFO("InitCcuContext: first-time registration (impl=V%d, tag=%s)",
-                static_cast<int>(impl) + 1, tag);
+    CC_LOG_INFO("InitCcuContext: first-time registration");
 
     // 1. Create engine context slot
-    HCCL_CHECK(HcclEngineCtxCreate(comm, tag, COMM_ENGINE_CCU,
+    HCCL_CHECK(HcclEngineCtxCreate(comm, kCtxTag, COMM_ENGINE_CCU,
                                    sizeof(CcuContext), &ctx));
     auto *ccuCtx = static_cast<CcuContext *>(ctx);
-    ccuCtx->impl = impl;
 
     // 2. Get topology info
     uint32_t rankId = 0;
@@ -189,13 +145,8 @@ HcclResult InitCcuContext(HcclComm comm) {
                                   channels.data()));
 
     // 4. Register CCU kernel (compiles Algorithm -> microcode IR)
-    if (impl == MsImpl::kV2) {
-        HCCL_CHECK(RegisterBatchedAGKernelMsV2(comm, &ccuCtx->kernelHandle,
-                                               rankId, rankSize, channels));
-    } else {
-        HCCL_CHECK(RegisterBatchedAGKernelMs(comm, &ccuCtx->kernelHandle,
-                                             rankId, rankSize, channels));
-    }
+    HCCL_CHECK(RegisterBatchedAGKernelMs(comm, &ccuCtx->kernelHandle,
+                                         rankId, rankSize, channels));
 
     // 5. Acquire CCU thread with enough notification slots
     HCCL_CHECK(HcclThreadAcquire(comm, COMM_ENGINE_CCU,
@@ -206,8 +157,8 @@ HcclResult InitCcuContext(HcclComm comm) {
     HCCL_CHECK(HcclCcuKernelRegisterFinish(comm));
 
     ccuCtx->initialized = true;
-    CC_LOG_INFO("InitCcuContext: ready (impl=V%d, rank=%u/%u, peers=%u)",
-                static_cast<int>(impl) + 1, rankId, rankSize, numPeers);
+    CC_LOG_INFO("InitCcuContext: ready rank=%u/%u peers=%u",
+                rankId, rankSize, numPeers);
     return HCCL_SUCCESS;
 }
 
@@ -229,16 +180,13 @@ HcclResult LaunchCcuKernel(HcclComm comm, const void *taskArg) {
         return HCCL_E_PARA;
     }
 
-    const MsImpl impl = GetMsImpl();
-    const char  *tag  = CtxTagFor(impl);
-
     void *ctx = nullptr;
     uint64_t ctxSize = 0;
-    HCCL_CHECK(HcclEngineCtxGet(comm, tag, COMM_ENGINE_CCU,
+    HCCL_CHECK(HcclEngineCtxGet(comm, kCtxTag, COMM_ENGINE_CCU,
                                 &ctx, &ctxSize));
     if (ctx == nullptr || ctxSize < sizeof(CcuContext)) {
-        CC_LOG_ERROR("LaunchCcuKernel: invalid ctx (ptr=%p, size=%llu, tag=%s)",
-                     ctx, static_cast<unsigned long long>(ctxSize), tag);
+        CC_LOG_ERROR("LaunchCcuKernel: invalid ctx (ptr=%p, size=%llu)",
+                     ctx, static_cast<unsigned long long>(ctxSize));
         return HCCL_E_INTERNAL;
     }
     auto *ccuCtx = static_cast<CcuContext *>(ctx);
@@ -247,10 +195,6 @@ HcclResult LaunchCcuKernel(HcclComm comm, const void *taskArg) {
         return HCCL_E_INTERNAL;
     }
 
-    if (ccuCtx->impl == MsImpl::kV2) {
-        return LaunchBatchedAGKernelMsV2(comm, ccuCtx->threadHandle,
-                                         ccuCtx->kernelHandle, *arg);
-    }
     return LaunchBatchedAGKernelMs(comm, ccuCtx->threadHandle,
                                    ccuCtx->kernelHandle, *arg);
 }
@@ -264,15 +208,12 @@ HcclResult GetCcuThreadHandle(HcclComm comm, uint64_t *threadHandle) {
         CC_LOG_ERROR("GetCcuThreadHandle: null comm or out-param");
         return HCCL_E_PARA;
     }
-    const MsImpl impl = GetMsImpl();
-    const char  *tag  = CtxTagFor(impl);
-
     void *ctx = nullptr;
     uint64_t ctxSize = 0;
-    HCCL_CHECK(HcclEngineCtxGet(comm, tag, COMM_ENGINE_CCU,
+    HCCL_CHECK(HcclEngineCtxGet(comm, kCtxTag, COMM_ENGINE_CCU,
                                 &ctx, &ctxSize));
     if (ctx == nullptr || ctxSize < sizeof(CcuContext)) {
-        CC_LOG_ERROR("GetCcuThreadHandle: ctx missing or too small (tag=%s)", tag);
+        CC_LOG_ERROR("GetCcuThreadHandle: ctx missing or too small");
         return HCCL_E_INTERNAL;
     }
     auto *ccuCtx = static_cast<CcuContext *>(ctx);

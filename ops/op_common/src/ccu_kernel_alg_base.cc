@@ -50,10 +50,8 @@ namespace ms = ::custom_comm::ms;  // go_size.h constants + bit-pack helpers
 // ============================================================
 // CalGoSize (parallelDim-aware)
 //
-// Mirrors ms::CalGoSize in go_size.cc but takes parallelDim as a parameter
-// so batched kernels that pick a non-default AllocGoResource(parallelDim)
-// can compute a matching host-side split. Kept out of go_size.{h,cc} so the
-// V1 kernel's ms::CalGoSize signature stays untouched.
+// Host-side GoSize calculation parametrized by parallelDim so the layout
+// emitted here matches the AllocGoResource(parallelDim) used at runtime.
 // ============================================================
 
 ms::GoSize CalGoSize(uint64_t size, uint32_t parallelDim) {

@@ -20,32 +20,7 @@ import torch
 import torch.distributed as dist
 import torch_npu  # registers torch.npu; also exposes ProcessGroupHCCL.Options
 
-
-# HCCL op-expansion-mode integers for 2.0 devices (Atlas A5 / 910_95).
-# Mirrors get_hccl_2_config() in the internal reference.  The
-# HCCL_OP_EXPANSION_MODE env var is ignored by torch_npu's backend; the only
-# reliable knob is a per-comm HcclCommConfig, set via
-# ProcessGroupHCCL.Options().hccl_config.
-_EXPANSION_MODE_MAP = {
-    "DEFAULT":    0,
-    "HOSTCPU_TS": 1,
-    "AICPU_TS":   2,
-    "AIV":        3,
-    "AIV_ONLY":   4,
-    "CCU_MS":     5,
-    "CCU_SCHED":  6,
-    "AICPU_UB":   7,
-}
-
-
-def build_hccl_options(expansion_mode_name):
-    if expansion_mode_name is None or expansion_mode_name == "NONE":
-        return None
-    opt = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    opt.hccl_config = {
-        "hccl_op_expansion_mode": int(_EXPANSION_MODE_MAP[expansion_mode_name])
-    }
-    return opt
+from _hccl_modes import EXPANSION_MODE as _EXPANSION_MODE_MAP, build_hccl_options
 
 
 def main():

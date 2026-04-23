@@ -196,8 +196,8 @@ class TestCcuPath:
         4096,
         4097,
         8192,
-        32768,    # v2: LoopGroup[0] entry threshold (memSlice * kV2ParallelDim)
-        49152,    # v2: LoopGroup[0] + LoopGroup[1] together (m=1, n=4, p=0)
+        32768,    # LoopGroup[0] entry threshold (memSlice * kMsParallelDim)
+        49152,    # LoopGroup[0] + LoopGroup[1] together (m=1, n=4, p=0)
         65536,
     ])
     def test_ccu_ms_size_boundary(self, bytes_per_desc):
@@ -209,6 +209,7 @@ class TestCcuPath:
         n = bytes_per_desc
         data = (torch.arange(n, dtype=torch.int64) + self.rank).to(torch.int8).to(self.device)
 
+        os.environ["HCCL_OP_EXPANSION_MODE"] = "CCU_MS"
         os.environ["CUSTOM_COMM_USE_CCU"] = "1"
         os.environ["CUSTOM_COMM_CCU_MODE"] = "ms"
         os.environ["CUSTOM_COMM_CCU_MS_DIAG"] = "1"
@@ -216,6 +217,7 @@ class TestCcuPath:
             [out_ms] = torch.ops.custom_comm.allgather_batch(
                 [data], self.hcom, self.world_size)
         finally:
+            os.environ.pop("HCCL_OP_EXPANSION_MODE", None)
             os.environ.pop("CUSTOM_COMM_USE_CCU", None)
             os.environ.pop("CUSTOM_COMM_CCU_MODE", None)
             os.environ.pop("CUSTOM_COMM_CCU_MS_DIAG", None)
@@ -230,33 +232,3 @@ class TestCcuPath:
             f"bytes_per_desc={bytes_per_desc}: "
             f"{diff_idx.numel()} / {expected.numel()} positions differ; "
             f"first diff indices: {diff_idx[:10].flatten().tolist()}")
-
-    def test_ccu_ms_v2_only(self):
-        """Smoke test: V2 kernel (GroupBroadcastBatch) produces the expected
-        all-gather of deterministic inputs. Mirrors test_ccu_only but forces
-        CCU_MODE=ms and CCU_MS_IMPL=v2 so the V2 code path is exercised
-        without relying on the v1-vs-SCHED diff from size_boundary.
-        """
-        import os
-        data = (torch.arange(256) + self.rank).to(torch.int8).to(self.device)
-        scale = (torch.arange(4, dtype=torch.float32) + self.rank * 4).to(self.device)
-
-        os.environ["CUSTOM_COMM_USE_CCU"]     = "1"
-        os.environ["CUSTOM_COMM_CCU_MODE"]    = "ms"
-        os.environ["CUSTOM_COMM_CCU_MS_IMPL"] = "v2"
-        try:
-            out_data, out_scale = torch.ops.custom_comm.allgather_batch(
-                [data, scale], self.hcom, self.world_size
-            )
-        finally:
-            os.environ.pop("CUSTOM_COMM_USE_CCU", None)
-            os.environ.pop("CUSTOM_COMM_CCU_MODE", None)
-            os.environ.pop("CUSTOM_COMM_CCU_MS_IMPL", None)
-
-        expected_data = torch.cat([
-            (torch.arange(256) + r).to(torch.int8) for r in range(self.world_size)
-        ]).to(self.device)
-        expected_scale = torch.arange(4 * self.world_size, dtype=torch.float32).to(self.device)
-
-        assert torch.equal(out_data, expected_data)
-        assert torch.equal(out_scale, expected_scale)

@@ -31,8 +31,6 @@ uint64_t GetLoopParam(uint64_t loopCtxId, uint64_t gsaOffset, uint64_t loopIterN
 uint64_t GetParallelParam(uint64_t repeatNum, uint64_t repeatLoopIndex, uint64_t totalLoopNum);
 uint64_t GetOffsetParam(uint64_t gsaOffset, uint64_t msOffset, uint64_t ckeOffset);
 
-GoSize CalGoSize(uint64_t totalBytes);
-
 }  // namespace ms
 }  // namespace custom_comm
 
