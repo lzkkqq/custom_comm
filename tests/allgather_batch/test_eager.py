@@ -37,9 +37,6 @@ def make_input(shape, dtype, device="meta"):
 class TestMetaKernel:
     """Shape inference via Meta dispatch. Runs anywhere."""
 
-    def _call(self, inputs, world_size):
-        return torch.ops.custom_comm.allgather_batch(inputs, "dummy", world_size)
-
     @pytest.mark.parametrize("world_size", [1, 2, 4, 8])
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_single_desc(self, world_size, dtype):

@@ -35,7 +35,3 @@ docs/raw/
 
 # OS
 .DS_Store
-
-# wip
-ccu_v2
-sync.sh
