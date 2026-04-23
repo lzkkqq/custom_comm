@@ -1,4 +1,4 @@
-# Copyright (c) 2026 custom_comm Authors. All rights reserved.
+ # Copyright (c) 2026 custom_comm Authors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Eager-mode tests for the allgather_batch operator.
@@ -36,6 +36,9 @@ def make_input(shape, dtype, device="meta"):
 @pytest.mark.ext
 class TestMetaKernel:
     """Shape inference via Meta dispatch. Runs anywhere."""
+
+    def _call(self, inputs, world_size):
+        return torch.ops.custom_comm.allgather_batch(inputs, "dummy", world_size)
 
     @pytest.mark.parametrize("world_size", [1, 2, 4, 8])
     @pytest.mark.parametrize("dtype", DTYPES)
@@ -223,9 +226,84 @@ class TestCcuPath:
             (torch.arange(n, dtype=torch.int64) + r).to(torch.int8)
             for r in range(self.world_size)
         ]).to(self.device)
-
+        torch.npu.synchronize(self.device)
         diff_idx = (out_ms != expected).nonzero()
         assert torch.equal(out_ms, expected), (
             f"bytes_per_desc={bytes_per_desc}: "
             f"{diff_idx.numel()} / {expected.numel()} positions differ; "
             f"first diff indices: {diff_idx[:10].flatten().tolist()}")
+
+    @pytest.mark.parametrize("data_dtype,scale_dtype", [
+        (torch.int8,     torch.float32),   # quant typical: weight/act int8 + scale fp32
+        (torch.int8,     torch.bfloat16),  # MoE common: scale in bf16
+        (torch.int8,     torch.float16),
+        (torch.float16,  torch.float32),   # non-quant baseline
+        (torch.bfloat16, torch.float32),
+        (torch.float32,  torch.float32),   # homogeneous fp32
+    ])
+    # n is element count; byte footprint = n * data_dtype.itemsize.
+    # Triples below follow test_ccu_ms_size_boundary's convention: they
+    # describe CalGoSize (m*256KB + n*4KB + p, parallelDim=64) decomposition
+    # for data bytes at int8 (bytes == n). For fp16/bf16/fp32 the same n
+    # yields 2x/4x bytes, landing each case in higher LoopGroup segments.
+    @pytest.mark.parametrize("n", [
+        256,                # (0, 0, 256)        p-only
+        1024,               # (0, 0, 1024)       p-only
+        2048,               # (0, 0, 2048)       p-only
+        4096,               # (0, 1, 0)          n=1, single-slot boundary
+        4097,               # (0, 1, 1)          n!=0 && p!=0, smallest
+        8192,               # (0, 2, 0)          n=2
+        32768,              # (0, 8, 0)          n=8
+        49152,              # (0, 12, 0)         n=12
+        65536,              # (0, 16, 0)         n=16
+        262144,             # (1, 0, 0)          LoopGroup[0] entry, m=1
+        262145,             # (1, 0, 1)          odd: m>=1 with tail p=1
+        1048576,            # (4, 0, 0)          m=4, pure LoopGroup[0]
+    ])
+    def test_ccu_ms_only(self, data_dtype, scale_dtype, n):
+        """CCU MS path smoke across dtype pairs AND data sizes: force
+        CCU_MODE=ms and check the GroupBroadcastBatch kernel produces the
+        all-gather of deterministic inputs, independent of the default CCU
+        dispatcher choice. Parameterized over dtype x size to prove the
+        kernel is dtype- and size-agnostic on the data+scale shape this
+        op is built for.
+        """
+        import os
+
+        # int8: mod-64 keeps per-rank values in [0, 127].
+        # float: mod-2048 keeps values below fp16's overflow threshold for
+        # any n. Any bf16 precision loss is deterministic and applies
+        # identically to expected and actual, so torch.equal still holds.
+        if data_dtype == torch.int8:
+            data_cpu = [((torch.arange(n) % 64) + r).to(data_dtype)
+                        for r in range(self.world_size)]
+        else:
+            data_cpu = [((torch.arange(n) % 2048) + r).to(data_dtype)
+                        for r in range(self.world_size)]
+        scale_cpu = [(torch.arange(4, dtype=torch.float32) + r * 4).to(scale_dtype)
+                     for r in range(self.world_size)]
+
+        data  = data_cpu[self.rank].to(self.device)
+        scale = scale_cpu[self.rank].to(self.device)
+
+        os.environ["HCCL_OP_EXPANSION_MODE"]  = "CCU_MS"
+        os.environ["CUSTOM_COMM_USE_CCU"]     = "1"
+        os.environ["CUSTOM_COMM_CCU_MODE"]    = "ms"
+        os.environ["CUSTOM_COMM_CCU_MS_DIAG"] = "1"
+        try:
+            out_data, out_scale = torch.ops.custom_comm.allgather_batch(
+                [data, scale], self.hcom, self.world_size
+            )
+        finally:
+            os.environ.pop("HCCL_OP_EXPANSION_MODE",  None)
+            os.environ.pop("CUSTOM_COMM_USE_CCU",     None)
+            os.environ.pop("CUSTOM_COMM_CCU_MODE",    None)
+            os.environ.pop("CUSTOM_COMM_CCU_MS_DIAG", None)
+
+        expected_data  = torch.cat(data_cpu).to(self.device)
+        expected_scale = torch.cat(scale_cpu).to(self.device)
+
+        torch.npu.synchronize(self.device)
+
+        assert torch.equal(out_data,  expected_data)
+        assert torch.equal(out_scale, expected_scale)
