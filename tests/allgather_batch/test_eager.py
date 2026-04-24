@@ -227,11 +227,7 @@ class TestCcuPath:
             for r in range(self.world_size)
         ]).to(self.device)
         torch.npu.synchronize(self.device)
-        diff_idx = (out_ms != expected).nonzero()
-        assert torch.equal(out_ms, expected), (
-            f"bytes_per_desc={bytes_per_desc}: "
-            f"{diff_idx.numel()} / {expected.numel()} positions differ; "
-            f"first diff indices: {diff_idx[:10].flatten().tolist()}")
+        assert torch.equal(out_ms, expected), f"bytes_per_desc={bytes_per_desc}: mismatch"
 
     @pytest.mark.parametrize("data_dtype,scale_dtype", [
         (torch.int8,     torch.float32),   # quant typical: weight/act int8 + scale fp32
