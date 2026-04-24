@@ -4,8 +4,19 @@
 """Benchmark: compare AllGather strategies for allgather_batch.
 
     torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
+    torchrun --nproc_per_node=8 tests/allgather_batch/bench.py --expansion-mode CCU_MS
+    torchrun --nproc_per_node=8 tests/allgather_batch/bench.py --expansion-mode CCU_SCHED
 """
-import torch, torch.distributed as dist
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _hccl_modes import EXPANSION_MODE as _EXPANSION_MODE_MAP, build_hccl_options  # noqa: E402
 
 HAS_NPU = False
 try:
@@ -34,12 +45,29 @@ def timed(fn):
 def main():
     if not HAS_NPU:
         return
-    dist.init_process_group(backend="hccl")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--expansion-mode", type=str, default="NONE",
+                    choices=list(_EXPANSION_MODE_MAP.keys()) + ["NONE"],
+                    help="HCCL op expansion mode (e.g. CCU_MS, CCU_SCHED).")
+    args = ap.parse_args()
+    mode = args.expansion_mode
+
+    os.environ.pop("HCCL_OP_EXPANSION_MODE", None)
+    dist.init_process_group(
+        backend="hccl", pg_options=build_hccl_options(mode)
+    )
     rank, ws = dist.get_rank(), dist.get_world_size()
     torch.npu.set_device(rank)
     dev = torch.device(f"npu:{rank}")
-    hcom = (dist.distributed_c10d._get_default_group()
-            ._get_backend(dev).get_hccl_comm_name(rank))
+    # Prefer the raw HcclComm handle (int64) via get_hccl_comm() when available:
+    # get_hccl_comm_name()→HcomGetCommHandleByGroup() on some torch_npu builds
+    # returns a comm whose internal collComm is nullptr under CCU modes
+    # (→ HcclGetRankSize HCCL_E_PTR).
+    backend = dist.distributed_c10d._get_default_group()._get_backend(dev)
+    if hasattr(backend, "get_hccl_comm"):
+        hcom = str(backend.get_hccl_comm(rank))
+    else:
+        hcom = backend.get_hccl_comm_name(rank)
 
     N, H, K = 32, 7168, 8
     x   = torch.randint(0, 127, (N, H), dtype=torch.int8,    device=dev)
@@ -93,7 +121,7 @@ def main():
                 ("E) 1 agb,pybind11(eager)",         te),
                 ("F) 1 agb,pybind11(in-place)",      tf)]
         mx = max(v for _, v in rows)
-        print(f"\nOPT-AG-04 Benchmark  W={ws}  N={N}")
+        print(f"\nOPT-AG-04 Benchmark  W={ws}  N={N}  mode={mode}")
         print("-" * 60)
         for label, us in rows:
             bar = "\u2588" * int(us / mx * 30)
