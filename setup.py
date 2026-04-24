@@ -120,6 +120,13 @@ _SHIM_INCLUDES = (
 )
 
 
+# Release build (default). Set CUSTOM_COMM_RELEASE=0 to fall back to -O2 with
+# assert() still firing — useful when debugging shim/runtime issues.
+_RELEASE = os.environ.get("CUSTOM_COMM_RELEASE", "1") != "0"
+_OPT_CFLAGS = ["-O3", "-DNDEBUG", "-flto"] if _RELEASE else ["-O2"]
+_OPT_LDFLAGS = ["-flto"] if _RELEASE else []
+
+
 _progress_lock = threading.Lock()
 _progress = {"done": 0, "total": 0}
 
@@ -132,7 +139,7 @@ def _compile_one(rel_src: str, obj_dir: str) -> str:
     cxx = os.environ.get("CXX", "g++")
     cmd = [
         cxx, "-c",
-        "-fPIC", "-std=c++17", "-O2", "-Wall",
+        "-fPIC", "-std=c++17", *_OPT_CFLAGS, "-Wall",
         "-D_GLIBCXX_USE_CXX11_ABI=0",
         # torch_npu 2.9 bundles an older hccl_types.h that uses
         # HCCL_COMM_HCCL_QOS_CONFIG_NOT_SET; CANN 9.0 uses the shorter
@@ -177,14 +184,15 @@ def build_shim():
     jobs = int(os.environ.get("MAX_JOBS") or os.cpu_count() or 1)
     _progress["done"] = 0
     _progress["total"] = len(SHIM_SOURCES)
-    _log(f"compiling {_progress['total']} shim sources (MAX_JOBS={jobs})")
+    _log(f"compiling {_progress['total']} shim sources "
+         f"(MAX_JOBS={jobs}, mode={'release' if _RELEASE else 'default'})")
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [pool.submit(_compile_one, s, obj_dir) for s in SHIM_SOURCES]
         objs = [f.result() for f in futures]
 
     cxx = os.environ.get("CXX", "g++")
-    link_cmd = [cxx, "-shared", "-fPIC",
+    link_cmd = [cxx, "-shared", "-fPIC", *_OPT_LDFLAGS,
                 f"-Wl,-soname,{SHIM_BASENAME}"] + objs
     for libdir in SDK_LIB:
         link_cmd += ["-L", libdir]
@@ -261,8 +269,9 @@ try:
         libraries=["custom_comm_impl"],
         extra_compile_args=[
             "-std=c++17",
+            *_OPT_CFLAGS,
         ] + [f"-isystem{d}" for d in SDK_ISYSTEM],
-        extra_link_args=["-Wl,-rpath,$ORIGIN"],
+        extra_link_args=["-Wl,-rpath,$ORIGIN", *_OPT_LDFLAGS],
         define_macros=_binding_macros,
     )]
     cmdclass = {"build_ext": BuildExtWithShim}
