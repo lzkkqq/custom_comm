@@ -1,30 +1,27 @@
-# custom_comm HcclAllGatherBatch 单板测试用例
+# custom_comm HcclAllGatherBatch 上板测试说明
 
-该目录是一个独立 C++ 上板测试程序，只测试 `HcclAllGatherBatch` C API。它不走 Python、Torch、pytest，也不需要改 `custom_comm` 其他目录，适合在 A5 单机环境直接验证接口功能和基础性能。
+该目录提供一个独立 C++ testcase，只测试 `HcclAllGatherBatch` 对外接口，并支持和标准 `HcclAllGather` 做总吞吐基线对比。整体使用方式对齐 `hccl/allgatherbatch/testcase`，但入口保持 `custom_comm` 当前 C API，不依赖 Python、Torch 或 pytest。
 
-## 1. 测试程序做什么
+## 1. 测什么
 
-测试程序会在 `--device-list` 指定的每张物理卡上启动一个线程，每个线程初始化自己的 HCCL rank，然后共同调用一次或多次 `HcclAllGatherBatch`。
+这个 testcase 只覆盖 device 侧数据路径：
 
-默认测试两个 item：
+- `custom` 模式：直接调用 `HcclAllGatherBatch`
+- `baseline` 模式：把所有 item 的输入按字节拼成一个大 `INT8` buffer，再调用一次标准 `HcclAllGather`
+- `both` 模式：同一组输入先跑 `custom`，再跑 `baseline`，最后输出 `delta(us)` 和 `speedup`
 
-| item | dataType | 默认规模 | sendCount 含义 | 校验方式 |
-| --- | --- | --- | --- | --- |
-| token | `HCCL_DATA_TYPE_INT8` | `327680` bytes | INT8 元素个数，也等于字节数 | 每个 rank 写不同 byte pattern，AllGather 后检查 `[rank0, rank1, ...]` |
-| scale | `HCCL_DATA_TYPE_FP32` | `128` 个 float | FP32 元素个数 | 每个 rank 写 `rank * 1000 + index`，AllGather 后逐元素检查 |
-
-默认 `--desc-count=2`，所以会同时覆盖 `INT8 token` 和 `FP32 scale`。如果指定 `--desc-count=1`，只测 `INT8 token`。
+这里的 baseline 不是逐 item 单独调多次 `HcclAllGather`，而是“总字节量等价”的单次大 AllGather，对比口径更稳定，也更适合做性能基线。
 
 ## 2. 目录和产物
 
 | 文件 | 作用 |
 | --- | --- |
-| `main.cc` | 测试程序源码，负责解析参数、初始化 ACL/HCCL、分配 device/host 内存、调用 `HcclAllGatherBatch`、同步并校验结果 |
-| `Makefile` | 独立构建脚本，编译 `main.cc` 并链接 `libcustom_comm_impl.so`、`libhccl.so`、`libhcomm.so`、`libascendcl.so` |
-| `run.sh` | 运行封装脚本，自动补 `LD_LIBRARY_PATH`，并通过第一个参数选择 decomposed/CCU/CCU MS 路径 |
-| `README.md` | 当前说明文档 |
+| `main.cc` | 参数解析、ACL/HCCL 初始化、device/host buffer 分配、benchmark 计时、结果校验 |
+| `Makefile` | 独立构建脚本，链接 `libcustom_comm_impl.so`、`libhccl.so`、`libhcomm.so`、`libascendcl.so` |
+| `run.sh` | 运行封装，自动设置 `LD_LIBRARY_PATH`，并切换 `decomposed` / `ccu` / `ccu-ms` |
+| `README.md` | 当前使用说明 |
 
-构建完成后会生成：
+构建后生成：
 
 ```text
 custom_comm/testcase/custom_comm_allgather_batch_testcase
@@ -32,23 +29,23 @@ custom_comm/testcase/custom_comm_allgather_batch_testcase
 
 ## 3. 环境变量含义
 
-| 变量 | 是否必需 | 含义 | 默认值 |
-| --- | --- | --- | --- |
-| `ASCEND_CANN_PACKAGE_PATH` | 建议设置 | CANN SDK 根目录，Makefile 会从这里找 ACL/HCCL/HCOMM 头文件和库 | 如果未设置，使用 `ASCEND_HOME_PATH`；两者都没有则使用 `/usr/local/Ascend/ascend-toolkit/latest` |
-| `ASCEND_HOME_PATH` | 可选 | CANN SDK 根目录的兼容变量，低优先级备用 | 无 |
-| `CUSTOM_COMM_LIB_DIR` | 可选 | `libcustom_comm_impl.so` 所在目录 | `custom_comm/python/custom_comm` |
-| `LD_LIBRARY_PATH` | 运行时需要 | 动态库搜索路径；`run.sh` 会自动追加 custom_comm 和 CANN lib 目录 | 继承当前环境 |
-| `CUSTOM_COMM_USE_CCU` | 运行时可选 | `1` 表示走 CCU 路径；不设置表示走 decomposed 路径 | 不设置 |
-| `CUSTOM_COMM_CCU_MODE` | 运行时可选 | `ms` 表示 CCU MS 后端；不设置时 CCU 走默认 sched 后端 | 不设置 |
-| `HCCL_OP_EXPANSION_MODE` | 运行时可选 | 控制 HCCL communicator 的 op expansion mode。`run.sh ccu` 会自动设为 `CCU_SCHED`，`run.sh ccu-ms` 会自动设为 `CCU_MS` | 不设置 |
+| 变量 | 是否必需 | 含义 |
+| --- | --- | --- |
+| `ASCEND_CANN_PACKAGE_PATH` | 建议设置 | CANN SDK 根目录，`Makefile` 用它查找 ACL/HCCL/HCOMM 头文件和库 |
+| `ASCEND_HOME_PATH` | 可选 | `ASCEND_CANN_PACKAGE_PATH` 的兼容兜底变量 |
+| `CUSTOM_COMM_LIB_DIR` | 可选 | `libcustom_comm_impl.so` 所在目录，默认是 `custom_comm/python/custom_comm` |
+| `LD_LIBRARY_PATH` | 运行时需要 | 动态库搜索路径，`run.sh` 会自动补齐 |
+| `CUSTOM_COMM_USE_CCU` | 运行时可选 | `1` 表示走 CCU 路径，不设置表示走 decomposed |
+| `CUSTOM_COMM_CCU_MODE` | 运行时可选 | `ms` 表示走 CCU MS 后端，不设置表示 CCU sched |
+| `HCCL_OP_EXPANSION_MODE` | 运行时可选 | communicator 的 op expansion mode，`run.sh ccu` 和 `run.sh ccu-ms` 会自动设置 |
 
-建议上板前先设置 SDK 路径：
+建议先明确 SDK 根目录：
 
 ```bash
 export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ```
 
-如果 `libcustom_comm_impl.so` 不在默认目录，需要指定：
+如果 `libcustom_comm_impl.so` 不在默认目录，再补：
 
 ```bash
 export CUSTOM_COMM_LIB_DIR=/path/to/custom_comm/python/custom_comm
@@ -56,58 +53,31 @@ export CUSTOM_COMM_LIB_DIR=/path/to/custom_comm/python/custom_comm
 
 ## 4. 第一步：构建 custom_comm 动态库
 
-测试程序链接的是 `custom_comm/python/custom_comm/libcustom_comm_impl.so`，所以要先在 `custom_comm` 根目录构建这个库。
-
-从仓库根目录进入 `custom_comm`：
+testcase 依赖 `custom_comm/python/custom_comm/libcustom_comm_impl.so`，所以要先在 `custom_comm` 根目录构建这个库：
 
 ```bash
 cd custom_comm
 python3 setup.py build_ext --inplace
 ```
 
-构建成功后确认动态库存在：
+构建成功后确认产物存在：
 
 ```bash
 ls -l python/custom_comm/libcustom_comm_impl.so
 ```
 
-如果这里不存在，后续 `make` 会报：
-
-```text
-missing .../custom_comm/python/custom_comm/libcustom_comm_impl.so
-please build custom_comm first, e.g. cd .. && python3 setup.py build_ext --inplace
-```
+如果当前环境没有 `torch_npu`，现在的 `setup.py` 也会继续构建 `libcustom_comm_impl.so`，只是跳过 Python 扩展 `_C*.so`。对这个 testcase 来说，关键产物就是 `libcustom_comm_impl.so`。
 
 ## 5. 第二步：编译 testcase
 
 进入 testcase 目录：
 
 ```bash
-cd testcase
-make
-```
-
-也可以从仓库根目录直接执行：
-
-```bash
 cd custom_comm/testcase
 make
 ```
 
-`make` 实际做了三件事：
-
-1. 检查 `$(CUSTOM_COMM_LIB_DIR)/libcustom_comm_impl.so` 是否存在。
-2. 使用 `g++ -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=0` 编译 `main.cc`。
-3. 链接 `-lcustom_comm_impl -lhccl -lhcomm -lascendcl -lpthread` 生成可执行文件。
-
-如果需要看完整编译命令，可以执行：
-
-```bash
-make clean
-make V=1
-```
-
-如果要手动指定 SDK 或库目录：
+如果想显式指定 SDK 和 custom_comm 库目录：
 
 ```bash
 make clean
@@ -115,7 +85,13 @@ make ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest \
      CUSTOM_COMM_LIB_DIR=/path/to/custom_comm/python/custom_comm
 ```
 
-清理 testcase 产物：
+`make` 主要做三件事：
+
+1. 检查 `$(CUSTOM_COMM_LIB_DIR)/libcustom_comm_impl.so` 是否存在
+2. 用 `g++ -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=0` 编译 `main.cc`
+3. 链接 `-lcustom_comm_impl -lhccl -lhcomm -lascendcl -lpthread`
+
+清理产物：
 
 ```bash
 make clean
@@ -123,9 +99,9 @@ make clean
 
 ## 6. 第三步：运行 testcase
 
-推荐使用 `bash run.sh`，因为它会自动设置运行时库路径。
+推荐统一用 `run.sh`，它会自动补运行时库路径，并根据模式设置 communicator 相关环境变量。
 
-默认运行 decomposed 路径，跑 0、1 两张卡，`desc-count=2`：
+默认运行 decomposed 路径：
 
 ```bash
 bash run.sh
@@ -137,184 +113,256 @@ bash run.sh
 bash run.sh --device-list 4,5,6,7
 ```
 
-跑 8 卡，计时 10 次：
+跑 `custom` 与标准 `AllGather` 基线对比：
 
 ```bash
-bash run.sh --device-list 0,1,2,3,4,5,6,7 --iters 10
+bash run.sh --device-list 4,5,6,7 --mode both
 ```
 
-走 CCU sched 路径：
+走 CCU sched：
 
 ```bash
-bash run.sh ccu --device-list 0,1,2,3 --iters 10
+bash run.sh ccu --device-list 4,5,6,7 --mode both
 ```
 
-走 CCU MS 路径：
+走 CCU MS：
 
 ```bash
-bash run.sh ccu-ms --device-list 0,1,2,3 --iters 10
+bash run.sh ccu-ms --device-list 4,5,6,7 --mode both
 ```
 
-只做功能冒烟，缩小 token 输入：
+## 7. 新参数模型
 
-```bash
-bash run.sh --device-list 0,1 --bytes 4096 --scale-count 128 --iters 1
+这个 testcase 已经完全切到重复 `--item` 模式，不再使用旧的 `--desc-count`、`--bytes`、`--scale-count`。
+
+### 7.1 `--item`
+
+`--item` 可以重复出现，每个 item 的格式是：
+
+```text
+dtype:count
 ```
 
-跳过 host 侧结果校验，只看接口是否能正常提交和同步：
+说明：
 
-```bash
-bash run.sh --device-list 0,1 --no-verify
+- `dtype` 是 HCCL 数据类型名字
+- `count` 是这个 item 的元素个数，不是字节数
+- 多个 `--item` 的顺序，就是传给 `HcclAllGatherBatch` 的 `descs[]` 顺序
+- item 数上限跟当前实现保持一致，最多 `6` 个
+
+支持的 dtype 名字：
+
+```text
+int8 uint8 int16 uint16 fp16 bf16 int32 uint32 fp32 int64 uint64 fp64 int128 hif8 fp8e4m3 fp8e5m2 fp8e8m0
 ```
 
-## 7. run.sh 的模式参数
+默认 item 是两项：
 
-`run.sh` 的第一个参数如果是 `decomposed`、`ccu`、`ccu-ms`，会被当作路径选择模式；其余参数原样传给测试程序。
-
-| 命令 | 设置的环境变量 | 实际路径 |
-| --- | --- | --- |
-| `bash run.sh ...` | 清理 `CUSTOM_COMM_USE_CCU` 和 `CUSTOM_COMM_CCU_MODE` | decomposed |
-| `bash run.sh decomposed ...` | 清理 `CUSTOM_COMM_USE_CCU`、`CUSTOM_COMM_CCU_MODE` 和 `HCCL_OP_EXPANSION_MODE` | decomposed |
-| `bash run.sh ccu ...` | `CUSTOM_COMM_USE_CCU=1`，`HCCL_OP_EXPANSION_MODE=CCU_SCHED` | CCU sched |
-| `bash run.sh ccu-ms ...` | `CUSTOM_COMM_USE_CCU=1`，`CUSTOM_COMM_CCU_MODE=ms`，`HCCL_OP_EXPANSION_MODE=CCU_MS` | CCU MS |
-
-如果不使用 `run.sh`，也可以手动运行：
-
-```bash
-export LD_LIBRARY_PATH="${CUSTOM_COMM_LIB_DIR}:${ASCEND_CANN_PACKAGE_PATH}/lib64:${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/lib64:${ASCEND_CANN_PACKAGE_PATH}/hcomm/hcomm/lib64:${LD_LIBRARY_PATH}"
-./custom_comm_allgather_batch_testcase --device-list 0,1
+```text
+--item int8:327680 --item fp32:128
 ```
 
-## 8. 测试程序参数
+### 7.2 其他参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--device-list` | `0,1` | 物理卡列表，最多 8 张；逻辑 rank 为列表下标，例如 `4,5,6,7` 对应逻辑 rank `0..3` |
-| `--desc-count` | `2` | `1` 表示只测 `INT8 token`；`2` 表示同时测 `INT8 token` 和 `FP32 scale` |
-| `--bytes` | `327680` | 每个 rank 的 INT8 token 字节数；因为 dtype 是 INT8，所以也等于 sendCount |
-| `--scale-count` | `128` | 每个 rank 的 FP32 scale 元素个数；实际字节数是 `scale-count * 4` |
-| `--warmup` | `1` | 计时前 warmup 次数；warmup 会调用接口并同步，但不计入平均耗时 |
-| `--iters` | `1` | 计时迭代次数；平均耗时为总耗时除以该值 |
-| `--no-verify` | 关闭 | 跳过 host 侧结果校验，适合只测 launch 或排查同步问题 |
-| `--help` | 无 | 打印参数说明 |
+| `--device-list` | `0,1` | 物理卡号列表，逻辑 rank 是列表下标 |
+| `--warmup` | `1` | warmup 次数 |
+| `--iters` | `1` | 计时次数 |
+| `--mode` | `custom` | `custom` / `baseline` / `both` |
+| `--timing-mode` | `device` | `host` / `device` |
+| `--no-verify` | 关闭 | 跳过 host 侧结果校验 |
 
-`--device-list` 指的是物理卡号，不是 HCCL rank。比如：
+`--timing-mode` 说明：
+
+- `device`：默认模式，参考 `hccl/allgatherbatch/testcase`，使用额外 stream/event 做 gate，尽量把计时收敛到 device 执行段
+- `host`：更接近整条提交流程，直接以业务 stream 上的 event 计时
+
+## 8. 常用示例
+
+默认两 item，跑 decomposed：
 
 ```bash
 bash run.sh --device-list 4,5,6,7
 ```
 
-程序会使用物理卡 `4,5,6,7`，但逻辑 rank 分别是：
+显式指定两 item，做 custom 与 baseline 对比：
 
-| 物理卡 | 逻辑 rank |
-| --- | --- |
-| 4 | 0 |
-| 5 | 1 |
-| 6 | 2 |
-| 7 | 3 |
-
-## 9. 预期输出
-
-成功时会先打印本次配置：
-
-```text
-custom_comm HcclAllGatherBatch testcase starts, deviceList=0,1,2,3, rankSize=4, descCount=2, tokenBytes=327680, scaleCount=128, warmup=1, iters=10, verify=on
+```bash
+bash run.sh --device-list 4,5,6,7 \
+    --item int8:327680 \
+    --item fp32:128 \
+    --mode both
 ```
 
-rank0 会打印平均耗时和估算带宽：
+三 item，小数据量功能验证：
 
-```text
-avgTime(us)=..., dataSize(B)=..., algoBandwidth(GB/s)=...
+```bash
+bash run.sh --device-list 0,1 \
+    --item int8:4096 \
+    --item fp16:256 \
+    --item bf16:256 \
+    --iters 1
 ```
 
-每个 rank 校验成功后会打印：
+只做 device 侧 benchmark，不回读校验：
 
-```text
-[rank 0, device 0] verify success
-[rank 1, device 1] verify success
+```bash
+bash run.sh --device-list 4,5,6,7 \
+    --item int8:327680 \
+    --item fp32:128 \
+    --mode both \
+    --timing-mode device \
+    --no-verify
 ```
 
-全部成功时最后打印：
+CCU MS 路径：
+
+```bash
+bash run.sh ccu-ms --device-list 4,5,6,7 \
+    --item int8:327680 \
+    --item fp32:128 \
+    --mode both
+```
+
+## 9. `run.sh` 的模式语义
+
+`run.sh` 第一个参数如果是 `decomposed`、`ccu`、`ccu-ms`，会被当作执行路径；其余参数原样透传给 testcase。
+
+| 命令 | 自动设置的环境变量 | 实际路径 |
+| --- | --- | --- |
+| `bash run.sh ...` | 清理 `CUSTOM_COMM_USE_CCU`、`CUSTOM_COMM_CCU_MODE`、`HCCL_OP_EXPANSION_MODE` | decomposed |
+| `bash run.sh decomposed ...` | 同上 | decomposed |
+| `bash run.sh ccu ...` | `CUSTOM_COMM_USE_CCU=1`，`HCCL_OP_EXPANSION_MODE=CCU_SCHED` | CCU sched |
+| `bash run.sh ccu-ms ...` | `CUSTOM_COMM_USE_CCU=1`，`CUSTOM_COMM_CCU_MODE=ms`，`HCCL_OP_EXPANSION_MODE=CCU_MS` | CCU MS |
+
+同时，testcase 本身也会根据 `CUSTOM_COMM_USE_CCU` / `CUSTOM_COMM_CCU_MODE` 在 communicator 初始化时切换：
+
+- decomposed：`HcclCommInitRootInfo`
+- ccu：`HcclCommInitRootInfoConfig + hcclOpExpansionMode=6`
+- ccu-ms：`HcclCommInitRootInfoConfig + hcclOpExpansionMode=5`
+
+## 10. 输出怎么看
+
+启动时会先打印本次配置，例如：
+
+```text
+custom_comm HcclAllGatherBatch testcase starts, deviceList=4,5,6,7, rankSize=4, items=int8:327680,fp32:128, warmup=1, iters=10, mode=both, timingMode=device, verify=on
+mode       | dataSize(B)        | avgTime(us)    | algoBandwidth(GB/s)  | status
+```
+
+如果 `mode=both`，rank0 会打印两行 benchmark 结果：
+
+```text
+custom     | ...
+baseline   | ...
+compare    | delta(us)=..., speedup=...x
+```
+
+其中：
+
+- `dataSize(B)`：按“单 rank 总发送字节数 × rankSize”统计
+- `avgTime(us)`：平均耗时
+- `algoBandwidth(GB/s)`：按同一口径估算的算法带宽
+- `speedup`：`baseline / custom`
+
+如果开启校验，每个 rank 还会打印：
+
+```text
+[rank 0, device 4] verify success
+```
+
+最终成功结束时打印：
 
 ```text
 custom_comm HcclAllGatherBatch testcase finished successfully
 ```
 
-## 10. 常见问题
+## 11. 校验逻辑
 
-### 10.1 找不到 `libcustom_comm_impl.so`
+校验使用的是“按字节的确定性模式”，不依赖某个 dtype 的浮点格式解释，因此：
 
-现象：
+- `custom` 路径会逐 item 校验每个源 rank 的输出片段
+- `baseline` 路径会校验大 `INT8` 输出是否等于所有 item 输入按顺序拼接后的结果
 
-```text
-missing .../custom_comm/python/custom_comm/libcustom_comm_impl.so
-```
+这意味着：
 
-处理：
+- 可以同时覆盖多 item 拆分/拼接顺序是否正确
+- 不会因为 host 侧 float/bfloat16 转换实现差异带来额外噪声
+
+## 12. 常见问题
+
+### 12.1 提示找不到 `libcustom_comm_impl.so`
+
+先回到 `custom_comm` 根目录执行：
 
 ```bash
-cd custom_comm
 python3 setup.py build_ext --inplace
-cd testcase
-make
 ```
 
-如果库在其他目录，设置：
+然后确认：
 
 ```bash
-export CUSTOM_COMM_LIB_DIR=/actual/path/to/libcustom_comm_impl_dir
+ls -l python/custom_comm/libcustom_comm_impl.so
 ```
 
-### 10.2 运行时报 `error while loading shared libraries`
+### 12.2 动态库加载失败
 
-一般是 `LD_LIBRARY_PATH` 没有包含 custom_comm 或 CANN lib 目录。优先用：
+优先直接使用：
 
 ```bash
-bash run.sh --device-list 0,1
+bash run.sh ...
 ```
 
-如果手动运行，先设置：
+如果要手工运行，先补：
 
 ```bash
 export LD_LIBRARY_PATH="${CUSTOM_COMM_LIB_DIR}:${ASCEND_CANN_PACKAGE_PATH}/lib64:${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/lib64:${ASCEND_CANN_PACKAGE_PATH}/hcomm/hcomm/lib64:${LD_LIBRARY_PATH}"
 ```
 
-### 10.3 `device is out of range`
+### 12.3 `invalid item spec`
 
-说明 `--device-list` 里的物理卡号超过当前机器 ACL 能看到的设备数量。先确认设备：
-
-```bash
-npu-smi info
-```
-
-然后改成有效卡号，例如：
+说明 `--item` 格式不对。合法示例：
 
 ```bash
-bash run.sh --device-list 0,1,2,3
+--item int8:327680
+--item fp32:128
+--item bf16:256
 ```
 
-### 10.4 校验失败
+不合法示例：
 
-如果出现：
+```bash
+--item int8
+--item fp32:
+--item :128
+--item fp32:0
+```
+
+### 12.4 校验失败
+
+如果日志里出现：
 
 ```text
-token verify failed: srcRank=..., index=..., actual=..., expected=...
-scale verify failed: srcRank=..., index=..., actual=..., expected=...
+custom verify failed: ...
+baseline verify failed: ...
 ```
 
-说明 `HcclAllGatherBatch` 返回成功，但输出内容和预期不一致。此时优先记录：
+说明接口返回成功，但输出内容与预期不一致。建议同时记录：
 
-- 当前运行路径：decomposed、ccu 还是 ccu-ms。
-- `--device-list`、`--desc-count`、`--bytes`、`--scale-count`、`--iters`。
-- 第一个 mismatch 的 `srcRank` 和 `index`。
+- 路径：decomposed / ccu / ccu-ms
+- `--device-list`
+- 所有 `--item`
+- `--mode`
+- `--timing-mode`
+- 第一个 mismatch 的 `item`、`srcRank`、`byteOffset`
 
-### 10.5 接口调用失败
+### 12.5 只想测 device 侧性能，不想做 host 回读
 
-如果出现：
+直接加：
 
-```text
-acl call failed: ...
-hccl call failed: ...
+```bash
+--timing-mode device --no-verify
 ```
 
-说明 ACL/HCCL 接口返回非成功码。日志会打印失败调用、源码行号和返回码，可先根据失败点区分是设备初始化、comm 初始化、内存分配、接口调用还是同步阶段失败。
+这样仍会分配并使用 device buffer，但不会把输出拷回 host 校验，更适合纯性能回归。
