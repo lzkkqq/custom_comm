@@ -5,7 +5,7 @@ ASCEND_CANN_PACKAGE_PATH := /usr/local/Ascend/ascend-toolkit/latest
 endif
 
 TARGET := custom_comm_allgather_batch_testcase
-CUSTOM_COMM_LIB_DIR ?= $(abspath $(CUSTOM_COMM_ROOT)/python/custom_comm)
+CUSTOM_COMM_LIB_DIR = $(abspath $(CUSTOM_COMM_ROOT)/python/custom_comm)
 
 CXX ?= g++
 CXXFLAGS ?= -O2 -g
