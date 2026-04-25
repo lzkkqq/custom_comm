@@ -4,10 +4,9 @@
 """Benchmark: compare AllGather strategies for allgather_batch.
 
     torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
-    torchrun --nproc_per_node=8 tests/allgather_batch/bench.py --expansion-mode CCU_MS
-    torchrun --nproc_per_node=8 tests/allgather_batch/bench.py --expansion-mode CCU_SCHED
+    HCCL_OP_EXPANSION_MODE=CCU_MS    torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
+    HCCL_OP_EXPANSION_MODE=CCU_SCHED torchrun --nproc_per_node=8 tests/allgather_batch/bench.py
 """
-import argparse
 import os
 import sys
 from pathlib import Path
@@ -16,7 +15,7 @@ import torch
 import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from _hccl_modes import EXPANSION_MODE as _EXPANSION_MODE_MAP, build_hccl_options  # noqa: E402
+from _hccl_modes import build_hccl_options  # noqa: E402
 
 HAS_NPU = False
 try:
@@ -45,12 +44,7 @@ def timed(fn):
 def main():
     if not HAS_NPU:
         return
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--expansion-mode", type=str, default="NONE",
-                    choices=list(_EXPANSION_MODE_MAP.keys()) + ["NONE"],
-                    help="HCCL op expansion mode (e.g. CCU_MS, CCU_SCHED).")
-    args = ap.parse_args()
-    mode = args.expansion_mode
+    mode = os.environ.get("HCCL_OP_EXPANSION_MODE") or "NONE"
 
     os.environ.pop("HCCL_OP_EXPANSION_MODE", None)
     dist.init_process_group(
