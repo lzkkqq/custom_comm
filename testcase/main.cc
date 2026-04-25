@@ -1,5 +1,6 @@
 #include <acl/acl_rt.h>
 #include <hccl/hccl.h>
+#include <hccl/hccl_comm.h>
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +25,8 @@ constexpr uint32_t kMaxDescCount = 2;
 constexpr size_t kMaxDeviceCount = 8;
 constexpr uint64_t kDefaultTokenBytes = 320ULL * 1024ULL;
 constexpr uint64_t kDefaultScaleCount = 128ULL;
+constexpr uint32_t kCommOpExpansionModeCcuMs = 5;
+constexpr uint32_t kCommOpExpansionModeCcuSched = 6;
 
 struct TestOptions {
     std::vector<uint32_t> deviceList {0, 1};
@@ -307,6 +310,21 @@ bool CheckBufferSize(uint64_t elemCount, size_t elemSize, uint32_t rankSize, siz
     return true;
 }
 
+bool UseCcuCommConfig()
+{
+    const char *useCcu = std::getenv("CUSTOM_COMM_USE_CCU");
+    return useCcu != nullptr && (std::strcmp(useCcu, "1") == 0 || std::strcmp(useCcu, "true") == 0);
+}
+
+uint32_t GetCcuCommExpansionMode()
+{
+    const char *ccuMode = std::getenv("CUSTOM_COMM_CCU_MODE");
+    if (ccuMode != nullptr && (std::strcmp(ccuMode, "ms") == 0 || std::strcmp(ccuMode, "MS") == 0)) {
+        return kCommOpExpansionModeCcuMs;
+    }
+    return kCommOpExpansionModeCcuSched;
+}
+
 int RunOnDevice(void *arg)
 {
     ThreadContext *ctx = static_cast<ThreadContext *>(arg);
@@ -339,7 +357,15 @@ int RunOnDevice(void *arg)
     }
 
     ACLCHECK_GOTO(aclrtSetDevice(static_cast<int32_t>(ctx->physicalDevice)));
-    HCCLCHECK_GOTO(HcclCommInitRootInfo(ctx->rankSize, ctx->rootInfo, ctx->logicalRank, &comm));
+    if (UseCcuCommConfig()) {
+        HcclCommConfig config;
+        HcclCommConfigInit(&config);
+        // Current hcomm implementation interprets 5 as CCU_MS and 6 as CCU_SCHED.
+        config.hcclOpExpansionMode = GetCcuCommExpansionMode();
+        HCCLCHECK_GOTO(HcclCommInitRootInfoConfig(ctx->rankSize, ctx->rootInfo, ctx->logicalRank, &config, &comm));
+    } else {
+        HCCLCHECK_GOTO(HcclCommInitRootInfo(ctx->rankSize, ctx->rootInfo, ctx->logicalRank, &comm));
+    }
     ACLCHECK_GOTO(aclrtCreateStream(&stream));
 
     ACLCHECK_GOTO(aclrtMalloc(&token.sendDevice, token.sendBytes, ACL_MEM_MALLOC_HUGE_ONLY));

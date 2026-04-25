@@ -40,6 +40,7 @@ custom_comm/testcase/custom_comm_allgather_batch_testcase
 | `LD_LIBRARY_PATH` | 运行时需要 | 动态库搜索路径；`run.sh` 会自动追加 custom_comm 和 CANN lib 目录 | 继承当前环境 |
 | `CUSTOM_COMM_USE_CCU` | 运行时可选 | `1` 表示走 CCU 路径；不设置表示走 decomposed 路径 | 不设置 |
 | `CUSTOM_COMM_CCU_MODE` | 运行时可选 | `ms` 表示 CCU MS 后端；不设置时 CCU 走默认 sched 后端 | 不设置 |
+| `HCCL_OP_EXPANSION_MODE` | 运行时可选 | 控制 HCCL communicator 的 op expansion mode。`run.sh ccu` 会自动设为 `CCU_SCHED`，`run.sh ccu-ms` 会自动设为 `CCU_MS` | 不设置 |
 
 建议上板前先设置 SDK 路径：
 
@@ -173,9 +174,9 @@ bash run.sh --device-list 0,1 --no-verify
 | 命令 | 设置的环境变量 | 实际路径 |
 | --- | --- | --- |
 | `bash run.sh ...` | 清理 `CUSTOM_COMM_USE_CCU` 和 `CUSTOM_COMM_CCU_MODE` | decomposed |
-| `bash run.sh decomposed ...` | 清理 `CUSTOM_COMM_USE_CCU` 和 `CUSTOM_COMM_CCU_MODE` | decomposed |
-| `bash run.sh ccu ...` | `CUSTOM_COMM_USE_CCU=1` | CCU sched |
-| `bash run.sh ccu-ms ...` | `CUSTOM_COMM_USE_CCU=1 CUSTOM_COMM_CCU_MODE=ms` | CCU MS |
+| `bash run.sh decomposed ...` | 清理 `CUSTOM_COMM_USE_CCU`、`CUSTOM_COMM_CCU_MODE` 和 `HCCL_OP_EXPANSION_MODE` | decomposed |
+| `bash run.sh ccu ...` | `CUSTOM_COMM_USE_CCU=1`，`HCCL_OP_EXPANSION_MODE=CCU_SCHED` | CCU sched |
+| `bash run.sh ccu-ms ...` | `CUSTOM_COMM_USE_CCU=1`，`CUSTOM_COMM_CCU_MODE=ms`，`HCCL_OP_EXPANSION_MODE=CCU_MS` | CCU MS |
 
 如果不使用 `run.sh`，也可以手动运行：
 

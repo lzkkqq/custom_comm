@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build_ext import build_ext as SetuptoolsBuildExt
 
 
 _TTY = sys.stdout.isatty()
@@ -242,6 +243,14 @@ def _verify_shim_abi() -> None:
 
 ext_modules = []
 cmdclass = {}
+_torch_ext_skip_reason = None
+
+
+class BuildExtShimOnly(SetuptoolsBuildExt):
+    def run(self):
+        build_shim()
+        if _torch_ext_skip_reason:
+            _log(f"skip torch extension build: {_torch_ext_skip_reason}")
 
 try:
     from torch.utils.cpp_extension import BuildExtension
@@ -275,8 +284,9 @@ try:
         define_macros=_binding_macros,
     )]
     cmdclass = {"build_ext": BuildExtWithShim}
-except ImportError:
-    pass
+except ImportError as exc:
+    _torch_ext_skip_reason = str(exc)
+    cmdclass = {"build_ext": BuildExtShimOnly}
 
 
 setup(

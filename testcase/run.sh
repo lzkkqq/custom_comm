@@ -27,14 +27,17 @@ case "${mode}" in
     decomposed|default)
         unset CUSTOM_COMM_USE_CCU || true
         unset CUSTOM_COMM_CCU_MODE || true
+        unset HCCL_OP_EXPANSION_MODE || true
         ;;
     ccu)
         export CUSTOM_COMM_USE_CCU=1
         unset CUSTOM_COMM_CCU_MODE || true
+        export HCCL_OP_EXPANSION_MODE="CCU_SCHED"
         ;;
     ccu-ms)
         export CUSTOM_COMM_USE_CCU=1
         export CUSTOM_COMM_CCU_MODE=ms
+        export HCCL_OP_EXPANSION_MODE="CCU_MS"
         ;;
 esac
 
