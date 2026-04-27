@@ -49,6 +49,14 @@ HcclResult HcclAllGatherBatch(
     HcclComm comm,
     aclrtStream stream);
 
+// Resolve the CCU EngineCtx slave stream for `comm`. The handle is owned by
+// the CCU EngineCtx; callers must not free it. Initializes the CCU EngineCtx
+// on first call. Used by torch_ext to register the slave stream into an
+// active aclGraph capture so the CCU kernel runs in the captured graph.
+HcclResult HcclAllGatherBatchGetCcuSlaveStream(
+    HcclComm comm,
+    aclrtStream *slaveStream);
+
 #ifdef __cplusplus
 }
 #endif

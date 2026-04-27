@@ -17,6 +17,7 @@ Run:
 
 import pytest
 import torch
+import torch.distributed as dist
 
 
 # ============================================================
@@ -149,7 +150,7 @@ class TestGraphModeE2E:
 @pytest.mark.ext
 @pytest.mark.dist
 class TestAclGraphCapture:
-    """aclGraph capture correctness on NPU."""
+    """aclGraph capture/replay correctness."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, dist_ctx):
@@ -158,41 +159,236 @@ class TestAclGraphCapture:
         self.device = dist_ctx.device
         self.hcom = dist_ctx.hcom
 
+    def _gather_expected(self, values_by_rank, dtype):
+        return torch.cat([
+            torch.as_tensor(v, dtype=dtype, device=self.device)
+            for v in values_by_rank
+        ])
+
+    def _capture_graph(self, fn):
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            outputs = fn()
+        return graph, outputs
+
+    def _manual_capture_graph(self, fn, stream_=None):
+        import torch_npu  # noqa: F401
+
+        if stream_ is None:
+            stream_ = torch_npu.npu.Stream()
+        with torch_npu.npu.stream(stream_):
+            graph = torch_npu.npu.NPUGraph()
+            graph.capture_begin()
+            outputs = fn()
+            graph.capture_end()
+        return stream_, graph, outputs
+
+    def _manual_replay(self, stream_, graph):
+        import torch_npu  # noqa: F401
+
+        with torch_npu.npu.stream(stream_):
+            graph.replay()
+        torch.npu.synchronize()
+
+
     def test_aclgraph_capture_replay(self):
         """aclGraph capture + replay should produce correct results."""
         import custom_comm
 
-        data = torch.ones(64, dtype=torch.float16, device=self.device) * (self.rank + 1)
-        scale = torch.ones(4, dtype=torch.float32, device=self.device) * (self.rank + 1)
+        # Capture uses static tensors; replay should consume updated contents
+        # after in-place copies, mirroring the canonical aclGraph testing style.
+        static_data = torch.ones(64, dtype=torch.float16, device=self.device) * (self.rank + 1)
+        static_scale = torch.ones(4, dtype=torch.float32, device=self.device) * (self.rank + 1)
 
         # Warmup (required before capture)
-        _ = custom_comm.allgather_batch([data, scale], self.hcom, self.world_size)
+        _ = custom_comm.allgather_batch([static_data, static_scale], self.hcom, self.world_size)
         torch.npu.synchronize()
 
-        # Capture
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph):
-            out = custom_comm.allgather_batch([data, scale], self.hcom, self.world_size)
+        stream_, graph, out = self._manual_capture_graph(
+            lambda: custom_comm.allgather_batch([static_data, static_scale], self.hcom, self.world_size)
+        )
 
-        # Replay
-        graph.replay()
-        torch.npu.synchronize()
+        real_data = torch.full(
+            static_data.shape,
+            self.rank + 11,
+            dtype=static_data.dtype,
+            device=self.device,
+        )
+        real_scale = torch.arange(4, dtype=torch.float32, device=self.device) + self.rank * 10
+
+        static_data.copy_(real_data)
+        static_scale.copy_(real_scale)
+
+        self._manual_replay(stream_, graph)
+
+        expected_data = self._gather_expected(
+            [torch.ones(64, dtype=torch.float16) * (r + 11) for r in range(self.world_size)],
+            torch.float16,
+        )
+        expected_scale = self._gather_expected(
+            [torch.arange(4, dtype=torch.float32) + r * 10 for r in range(self.world_size)],
+            torch.float32,
+        )
 
         assert out[0].shape == (64 * self.world_size,)
         assert out[1].shape == (4 * self.world_size,)
+        assert torch.equal(out[0], expected_data)
+        assert torch.equal(out[1], expected_scale)
+
+    def test_aclgraph_multiple_graph_instances(self):
+        """Two captured graphs with different ops should coexist and replay independently."""
+        import custom_comm
+
+        static_b = torch.arange(16, dtype=torch.float32, device=self.device) + self.rank * 10
+
+        dist.broadcast(static_b, src=0)
+        torch.npu.synchronize()
+        stream_, graph_b, _ = self._manual_capture_graph(
+            lambda: (dist.broadcast(static_b, src=0), static_b)[1]
+        )
+
+        real_b = torch.arange(16, dtype=torch.float32, device=self.device) + self.rank * 10 + 5
+        static_b.copy_(real_b)
+        self._manual_replay(stream_, graph_b)
+        expected_b = torch.arange(16, dtype=torch.float32, device=self.device) + 5
+        assert torch.equal(static_b, expected_b)
+
+        static_a = (
+            torch.arange(64, dtype=torch.int64) + self.rank * 64
+        ).to(torch.int8).to(self.device)
+        _ = custom_comm.allgather_batch([static_a], self.hcom, self.world_size)
+        torch.npu.synchronize()
+        stream_a, graph_a, out_a = self._manual_capture_graph(
+            lambda: custom_comm.allgather_batch([static_a], self.hcom, self.world_size),
+            stream_=stream_,
+        )
+
+        real_a = (
+            torch.arange(64, dtype=torch.int64) + self.rank * 64 + 9
+        ).to(torch.int8).to(self.device)
+        static_a.copy_(real_a)
+        self._manual_replay(stream_a, graph_a)
+        expected_a = self._gather_expected(
+            [torch.arange(64, dtype=torch.int64) + r * 64 + 9 for r in range(self.world_size)],
+            torch.int8,
+        )
+        assert torch.equal(out_a[0], expected_a)
+
+        real_a_2 = (
+            torch.arange(64, dtype=torch.int64) + self.rank * 64 + 15
+        ).to(torch.int8).to(self.device)
+        static_a.copy_(real_a_2)
+        self._manual_replay(stream_a, graph_a)
+        expected_a_2 = self._gather_expected(
+            [torch.arange(64, dtype=torch.int64) + r * 64 + 15 for r in range(self.world_size)],
+            torch.int8,
+        )
+        assert torch.equal(out_a[0], expected_a_2)
+
+        real_b_2 = torch.arange(16, dtype=torch.float32, device=self.device) + self.rank * 10 + 7
+        static_b.copy_(real_b_2)
+        self._manual_replay(stream_, graph_b)
+        expected_b_2 = torch.arange(16, dtype=torch.float32, device=self.device) + 7
+        assert torch.equal(static_b, expected_b_2)
 
     def test_aclgraph_repeated_replay(self):
         """Multiple replays should give consistent results."""
         import custom_comm
 
-        data = torch.arange(32).to(torch.int8).to(self.device)
-        _ = custom_comm.allgather_batch([data], self.hcom, self.world_size)
+        static_data = (torch.arange(32) + self.rank * 32).to(torch.int8).to(self.device)
+        _ = custom_comm.allgather_batch([static_data], self.hcom, self.world_size)
         torch.npu.synchronize()
 
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph):
-            out = custom_comm.allgather_batch([data], self.hcom, self.world_size)
+        stream_, graph, out = self._manual_capture_graph(
+            lambda: custom_comm.allgather_batch([static_data], self.hcom, self.world_size)
+        )
 
-        for _ in range(10):
-            graph.replay()
-        assert out[0].shape[0] == data.shape[0] * self.world_size
+        for step in range(10):
+            real_data = (torch.arange(32) + self.rank * 32 + step).to(torch.int8).to(self.device)
+            static_data.copy_(real_data)
+            self._manual_replay(stream_, graph)
+
+            expected = self._gather_expected(
+                [torch.arange(32) + r * 32 + step for r in range(self.world_size)],
+                torch.int8,
+            )
+            assert torch.equal(out[0], expected)
+
+        assert out[0].shape[0] == static_data.shape[0] * self.world_size
+
+    def test_aclgraph_reset_then_recapture(self):
+        """reset() should release the old graph so a different-op recapture can proceed."""
+        import custom_comm
+        static_old = torch.arange(48, dtype=torch.float32, device=self.device) + self.rank * 3
+        dist.broadcast(static_old, src=0)
+        torch.npu.synchronize()
+
+        stream_, graph_old, _ = self._manual_capture_graph(
+            lambda: (dist.broadcast(static_old, src=0), static_old)[1]
+        )
+        graph_old.reset()
+        torch.npu.synchronize()
+
+        static_new = (
+            torch.arange(96, dtype=torch.int64) + self.rank * 2
+        ).to(torch.int8).to(self.device)
+        _ = custom_comm.allgather_batch([static_new], self.hcom, self.world_size)
+        torch.npu.synchronize()
+
+        stream_new, graph_new, out_new = self._manual_capture_graph(
+            lambda: custom_comm.allgather_batch([static_new], self.hcom, self.world_size),
+            stream_=stream_,
+        )
+
+        real_new = (
+            torch.arange(96, dtype=torch.int64) + self.rank * 2 + 21
+        ).to(torch.int8).to(self.device)
+        static_new.copy_(real_new)
+        self._manual_replay(stream_new, graph_new)
+
+        expected_new = self._gather_expected(
+            [torch.arange(96, dtype=torch.int64) + r * 2 + 21 for r in range(self.world_size)],
+            torch.int8,
+        )
+        assert torch.equal(out_new[0], expected_new)
+
+    def test_aclgraph_mixed_ops_single_graph(self):
+        """One graph may contain custom_comm plus a different built-in HCCL op in sequence."""
+        import custom_comm
+
+        static_a = (
+            torch.arange(64, dtype=torch.int64) + self.rank * 64
+        ).to(torch.int8).to(self.device)
+        static_b = torch.arange(32, dtype=torch.float32, device=self.device) + self.rank * 20
+
+        _ = custom_comm.allgather_batch([static_a], self.hcom, self.world_size)
+        dist.broadcast(static_b, src=0)
+        torch.npu.synchronize()
+
+        def capture_body():
+            out_a = custom_comm.allgather_batch([static_a], self.hcom, self.world_size)
+            dist.broadcast(static_b, src=0)
+            return out_a
+
+        stream_, graph, out_a = self._manual_capture_graph(capture_body)
+
+        real_a = (
+            torch.arange(64, dtype=torch.int64) + self.rank * 64 + 31
+        ).to(torch.int8).to(self.device)
+        real_b = torch.arange(32, dtype=torch.float32, device=self.device) + self.rank * 20 + 5
+
+        static_a.copy_(real_a)
+        static_b.copy_(real_b)
+
+        self._manual_replay(stream_, graph)
+
+        expected_a = self._gather_expected(
+            [torch.arange(64, dtype=torch.int64) + r * 64 + 31 for r in range(self.world_size)],
+            torch.int8,
+        )
+        expected_b = torch.arange(32, dtype=torch.float32, device=self.device) + 5
+
+        assert torch.equal(out_a[0], expected_a)
+        assert torch.equal(static_b, expected_b)
+
+

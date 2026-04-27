@@ -115,13 +115,8 @@ static HcclResult HcclAllGatherBatchImpl(
             aclError aclRet = aclmdlRICaptureGetInfo(stream, &captureStatus, &rtModel);
             if (aclRet == ACL_SUCCESS &&
                 captureStatus == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && rtModel != nullptr) {
-                uint64_t threadHandle = 0;
-                HCCL_CHECK(custom_comm::DispatchGetCcuThreadHandle(comm, &threadHandle));
                 aclrtStream slaveStream = nullptr;
-                uint32_t len = sizeof(slaveStream);
-                HCCL_CHECK(HcclThreadResGetInfo(
-                    comm, threadHandle, THREAD_RES_TYPE_STREAM,
-                    len, reinterpret_cast<void **>(&slaveStream)));
+                HCCL_CHECK(HcclAllGatherBatchGetCcuSlaveStream(comm, &slaveStream));
                 if (slaveStream != nullptr) {
                     rtStreamAddToModel(slaveStream, rtModel);
                 }
@@ -142,33 +137,10 @@ static HcclResult HcclAllGatherBatchImpl(
 
         ProfMark("custom_comm::ccu_launch::begin", stream);
 
-        // CCU path CCU kernel launch with optional slave stream profiling
-        HcclResult result;
-#ifndef __APPLE__
-        // If slave stream available, record events for precise device timing
-        uint64_t threadHandle = 0;
-        aclrtStream slaveStream = nullptr;
-        if (custom_comm::DispatchGetCcuThreadHandle(comm, &threadHandle) == HCCL_SUCCESS
-            && threadHandle != 0) {
-            uint32_t infoLen = sizeof(aclrtStream);
-            HcclThreadResGetInfo(comm, threadHandle, THREAD_RES_TYPE_STREAM,
-                                 infoLen, reinterpret_cast<void **>(&slaveStream));
-        }
-        if (slaveStream != nullptr) {
-            aclrtEvent startEvt = nullptr, endEvt = nullptr;
-            aclrtCreateEvent(&startEvt);
-            aclrtCreateEvent(&endEvt);
-            aclrtRecordEvent(startEvt, slaveStream);
-            result = custom_comm::DispatchLaunchCcuKernel(comm, &taskArg);
-            aclrtRecordEvent(endEvt, slaveStream);
-            // Events can be queried later for elapsed time via aclrtEventElapsedTime
-            aclrtDestroyEvent(startEvt);
-            aclrtDestroyEvent(endEvt);
-        } else
-#endif
-        {
-            result = custom_comm::DispatchLaunchCcuKernel(comm, &taskArg);
-        }
+        // Launch directly; profiling/timing events are intentionally omitted
+        // from the functional path because they are asynchronous and must not
+        // outlive the stream work they annotate.
+        HcclResult result = custom_comm::DispatchLaunchCcuKernel(comm, &taskArg);
 
         ProfMark("custom_comm::ccu_launch::end", stream);
         return result;
@@ -209,4 +181,32 @@ HcclResult HcclAllGatherBatch(
                      static_cast<int>(result));
     }
     return result;
+}
+
+HcclResult HcclAllGatherBatchGetCcuSlaveStream(
+    HcclComm comm,
+    aclrtStream *slaveStream) {
+    if (comm == nullptr || slaveStream == nullptr) {
+        CC_LOG_ERROR("HcclAllGatherBatchGetCcuSlaveStream: null input");
+        return HCCL_E_PTR;
+    }
+
+    *slaveStream = nullptr;
+    HCCL_CHECK(custom_comm::DispatchInitCcuContext(comm));
+
+    uint64_t threadHandle = 0;
+    HCCL_CHECK(custom_comm::DispatchGetCcuThreadHandle(comm, &threadHandle));
+
+    uint32_t len = sizeof(*slaveStream);
+    HCCL_CHECK(HcclThreadResGetInfo(comm,
+                                    threadHandle,
+                                    THREAD_RES_TYPE_STREAM,
+                                    len,
+                                    reinterpret_cast<void **>(slaveStream)));
+
+    if (*slaveStream == nullptr) {
+        CC_LOG_ERROR("HcclAllGatherBatchGetCcuSlaveStream: ctx resolved null slave stream");
+        return HCCL_E_INTERNAL;
+    }
+    return HCCL_SUCCESS;
 }

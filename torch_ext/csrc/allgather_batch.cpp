@@ -66,6 +66,11 @@ extern "C" int rtStreamAddToModel(void *stream, void *model);
 
 namespace {
 
+static bool UseCcuPathFromEnv() {
+    const char *val = std::getenv("CUSTOM_COMM_USE_CCU");
+    return val != nullptr && std::strcmp(val, "1") == 0;
+}
+
 // If `group` is a decimal representation of an integer, treat it as the raw
 // HcclComm pointer value (i.e. what ProcessGroupHCCL::getHcclComm(rank)
 // returns stringified). This bypasses HcomGetCommHandleByGroup entirely,
@@ -177,11 +182,78 @@ struct CommStreamCtx {
     }
 };
 
+struct CcuStreamSyncCtx {
+    aclrtEvent pre  = nullptr;
+    aclrtEvent post = nullptr;
+
+    void init() {
+        if (pre) return;
+        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&pre,  ACL_EVENT_SYNC));
+        ACL_TORCH_CHECK(aclrtCreateEventExWithFlag(&post, ACL_EVENT_SYNC));
+    }
+};
+
+static aclrtStream GetCcuSlaveStream(HcclComm comm) {
+    aclrtStream slaveStream = nullptr;
+    HCCL_TORCH_CHECK(HcclAllGatherBatchGetCcuSlaveStream(comm, &slaveStream));
+    TORCH_CHECK(slaveStream != nullptr, "CCU slave stream is null");
+    return slaveStream;
+}
+
+static void DispatchCcuOnSlaveStream(
+    const HcclAllGatherDesc *descs,
+    uint32_t descCount,
+    HcclComm comm,
+    aclrtStream computeStream) {
+    // CCU kernels execute on a thread-owned slave stream. In eager mode we
+    // explicitly synchronize compute <-> slave so builtin PG collectives that
+    // run later observe the same ordering boundary they expect from their own
+    // dedicated comm-stream choreography.
+    static thread_local CcuStreamSyncCtx ctx;
+    ctx.init();
+
+    aclrtStream slaveStream = GetCcuSlaveStream(comm);
+    ACL_TORCH_CHECK(aclrtRecordEvent(ctx.pre, computeStream));
+    ACL_TORCH_CHECK(aclrtStreamWaitEvent(slaveStream, ctx.pre));
+    HCCL_TORCH_CHECK(HcclAllGatherBatch(descs, descCount, comm, slaveStream));
+    ACL_TORCH_CHECK(aclrtRecordEvent(ctx.post, slaveStream));
+    ACL_TORCH_CHECK(aclrtStreamWaitEvent(computeStream, ctx.post));
+}
+
 static void DispatchHcclOnCommStream(
     const HcclAllGatherDesc *descs,
     uint32_t descCount,
     HcclComm comm,
     aclrtStream computeStream) {
+    aclmdlRICaptureStatus captureStatus = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI rtModel = nullptr;
+    aclError captureQuery = aclmdlRICaptureGetInfo(computeStream, &captureStatus, &rtModel);
+
+    // The CCU backend already has dedicated aclGraph handling inside
+    // HcclAllGatherBatch: during capture it resolves the CCU slave stream
+    // from the thread handle and binds that stream into the active model.
+    // Keep capture on the caller stream, but in eager mode explicitly sync
+    // compute <-> CCU slave stream to match builtin PG ordering semantics.
+    if (UseCcuPathFromEnv()) {
+        if (captureQuery == ACL_SUCCESS
+            && captureStatus == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE
+            && rtModel != nullptr) {
+            HCCL_TORCH_CHECK(HcclAllGatherBatch(descs, descCount, comm, computeStream));
+            return;
+        }
+        DispatchCcuOnSlaveStream(descs, descCount, comm, computeStream);
+        return;
+    }
+
+    // In normal eager execution, stay on the caller's compute stream. The
+    // extra comm-stream/event choreography is only needed while an aclGraph
+    // capture is active, and applying it eagerly breaks warmup calls.
+    if (captureQuery != ACL_SUCCESS
+        || captureStatus != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE
+        || rtModel == nullptr) {
+        HCCL_TORCH_CHECK(HcclAllGatherBatch(descs, descCount, comm, computeStream));
+        return;
+    }
 
     // Cached per-thread HCCL stream + sync events; cheaper than re-creating.
     static thread_local CommStreamCtx ctx;
@@ -191,17 +263,10 @@ static void DispatchHcclOnCommStream(
     // rtModel so that HCCL work on it is part of the captured graph. Without
     // this, the replay runs an empty graph and the collective is silently
     // dropped. rtStreamAddToModel is idempotent per (stream, model).
-    aclmdlRICaptureStatus captureStatus = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI rtModel = nullptr;
-    aclError captureQuery = aclmdlRICaptureGetInfo(computeStream, &captureStatus, &rtModel);
-    if (captureQuery == ACL_SUCCESS
-        && captureStatus == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE
-        && rtModel != nullptr) {
-        int addRet = rtStreamAddToModel(ctx.stream, rtModel);
-        TORCH_CHECK(addRet == 0,
-                    "rtStreamAddToModel failed with code ", addRet,
-                    " while registering comm stream into active aclGraph capture");
-    }
+    int addRet = rtStreamAddToModel(ctx.stream, rtModel);
+    TORCH_CHECK(addRet == 0,
+                "rtStreamAddToModel failed with code ", addRet,
+                " while registering comm stream into active aclGraph capture");
 
     ACL_TORCH_CHECK(aclrtRecordEvent(ctx.pre, computeStream));
     ACL_TORCH_CHECK(aclrtStreamWaitEvent(ctx.stream, ctx.pre));
